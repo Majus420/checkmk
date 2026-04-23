@@ -6,7 +6,7 @@ A collection of CheckMK plugins and extensions maintained by [Marius Gielnik](ma
 
 | Plugin | Description | Plugin Version | CheckMK Version |
 |---|---|---|---|
-| [unifi_special_agent](./plugins/unifi_special_agent/) | Unifi Controller monitoring via Special Agent | 1.0 | ≥ checkmk 2.2.0 |
+| [unifi_special_agent](./plugins/unifi_special_agent/) | Unifi Controller monitoring via Special Agent | 1.0 | ≥ 2.2.0 |
 
 ## License
 
