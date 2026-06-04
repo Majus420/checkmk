@@ -1,0 +1,26 @@
+title: MSSQL: Server Version (Online Update Check)
+agents: windows
+catalog: app/mssql
+license: GPL
+distribution: check_mk
+description:
+ Monitors the installed Microsoft SQL Server version per instance and checks
+ whether updates are available. No additional agent plugin is required — the
+ version is read from the {mssql_instance} section which is provided by the
+ standard CheckMK {mssql.vbs} or {mk-sql.exe} agent plugin.
+
+ The latest available builds are fetched automatically from the official
+ Microsoft Learn documentation:
+ {https://learn.microsoft.com/en-us/troubleshoot/sql/releases/sqlserver-{year}/build-versions}
+
+ The data is cached in {~/var/check_mk/mssql_latest_builds.json} and
+ refreshes automatically once per day — no cronjob required.
+
+ Supported SQL Server versions: 2014, 2016, 2017, 2019, 2022, 2025.
+
+item:
+ The SQL Server instance name, e.g. {MSSQLSERVER}, {DIAMANTP}, or {CITRIX}.
+
+discovery:
+ One service is created per SQL Server instance found in the
+ {mssql_instance} section.
