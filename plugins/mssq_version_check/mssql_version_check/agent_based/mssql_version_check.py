@@ -9,7 +9,11 @@
 # Build data source: Microsoft Learn (official)
 #   https://learn.microsoft.com/en-us/troubleshoot/sql/releases/sqlserver-{year}/build-versions
 #
-# Item = instance name (e.g. "MSSQLSERVER", "DIAMANTP", "CITRIX")
+# Two build numbers are cached per version:
+#   cu:     Latest Cumulative Update only
+#   cu_gdr: Latest CU + GDR (highest available build incl. security patches)
+#
+# Item = instance name (e.g. "MSSQLSERVER", "DIAMANTP")
 # Service name: "MSSQL <instance> Version"
 
 from __future__ import annotations
@@ -56,7 +60,6 @@ _MAJOR_TO_YEAR: Dict[str, str] = {
 
 _SQL_VERSIONS: List[str] = ["2014", "2016", "2017", "2019", "2022", "2025"]
 
-# Official Microsoft Learn build version pages
 _MSLEARN_URL = (
     "https://learn.microsoft.com/en-us/troubleshoot/sql/releases"
     "/sqlserver-{year}/build-versions"
@@ -66,20 +69,18 @@ _CACHE_FILENAME        = "var/check_mk/mssql_latest_builds.json"
 _CACHE_MAX_AGE_SECONDS = 24 * 60 * 60
 _HTTP_TIMEOUT          = 20
 
-# Matches table rows like:
-#   | CU23 (Latest) | 16.0.4236.2 | ...
-#   | CU22 + GDR (Latest) | 16.0.4230.2 | ...
-_LATEST_ROW_RE = re.compile(
-    r"<td>[^<]*\(Latest\)[^<]*</td>\s*<td>([\d]+\.[\d]+\.[\d]+\.[\d]+)</td>",
+# CU-only rows: <td>CU25</td> or <td>CU25 (Latest)</td> — excludes GDR rows
+_CU_BUILD_RE = re.compile(
+    r"<td>CU\d+(?:\s*\([^)]*\))?</td>\s*<td>(1[2-7]\.0\.\d+\.\d+)</td>",
     re.IGNORECASE,
 )
 
-# Fallback: match any build version in a table row (to find highest)
-_BUILD_RE = re.compile(r"<td>(1[2-7]\.0\.\d+\.\d+)</td>")
+# All builds (CU + GDR) — highest available
+_ALL_BUILD_RE = re.compile(r"<td>(1[2-7]\.0\.(\d{3,})\.\d+)</td>")
 
 
 # ---------------------------------------------------------------------------
-# Parsed type
+# Types
 # ---------------------------------------------------------------------------
 
 class MSSQLInstanceInfo(NamedTuple):
@@ -92,7 +93,7 @@ class MSSQLInstanceInfo(NamedTuple):
 
 
 # ---------------------------------------------------------------------------
-# Cache + fetch from Microsoft Learn
+# Cache + fetch
 # ---------------------------------------------------------------------------
 
 def _cache_path() -> str:
@@ -107,7 +108,8 @@ def _version_tuple(version_str: str) -> Tuple[int, ...]:
         return (0,)
 
 
-def _fetch_latest_build(year: str) -> Optional[str]:
+def _fetch_latest_builds(year: str) -> Tuple[Optional[str], Optional[str]]:
+    """Returns (latest_cu, latest_cu_gdr) for the given SQL Server year."""
     url = _MSLEARN_URL.format(year=year)
     try:
         req = urllib.request.Request(
@@ -120,22 +122,18 @@ def _fetch_latest_build(year: str) -> Optional[str]:
         with urllib.request.urlopen(req, timeout=_HTTP_TIMEOUT) as resp:
             content = resp.read().decode("utf-8", errors="replace")
     except Exception:
-        return None
+        return None, None
 
-    # First try: find row explicitly marked as (Latest)
-    match = _LATEST_ROW_RE.search(content)
-    if match:
-        return match.group(1)
+    cu_builds  = [m.group(1) for m in _CU_BUILD_RE.finditer(content)]
+    all_builds = [m.group(1) for m in _ALL_BUILD_RE.finditer(content)]
 
-    # Fallback: find all build numbers for this major version and return highest
-    builds = [m.group(1) for m in _BUILD_RE.finditer(content)]
-    if builds:
-        return max(builds, key=_version_tuple)
+    latest_cu     = max(cu_builds,  key=_version_tuple) if cu_builds  else None
+    latest_cu_gdr = max(all_builds, key=_version_tuple) if all_builds else None
 
-    return None
+    return latest_cu, latest_cu_gdr
 
 
-def _load_or_refresh_cache() -> Tuple[Optional[Dict[str, str]], Optional[str]]:
+def _load_or_refresh_cache() -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
     path     = _cache_path()
     do_fetch = False
 
@@ -147,11 +145,15 @@ def _load_or_refresh_cache() -> Tuple[Optional[Dict[str, str]], Optional[str]]:
             do_fetch = True
 
     if do_fetch:
-        result: Dict[str, str] = {}
+        result: Dict[str, Any] = {}
         for year in _SQL_VERSIONS:
-            build = _fetch_latest_build(year)
-            if build:
-                result[year] = build
+            latest_cu, latest_cu_gdr = _fetch_latest_builds(year)
+            if latest_cu or latest_cu_gdr:
+                result[year] = {}
+                if latest_cu:
+                    result[year]["cu"] = latest_cu
+                if latest_cu_gdr:
+                    result[year]["cu_gdr"] = latest_cu_gdr
 
         if not result:
             if os.path.exists(path):
@@ -286,11 +288,23 @@ def check_mssql_version_check(
         yield Result(state=State.UNKNOWN, summary="{} | {}".format(summary_base, cache_error))
         return
 
-    latest_build: Optional[str] = cache.get(year) if cache else None  # type: ignore[union-attr]
-    if not latest_build:
+    year_data = cache.get(year) if cache else None  # type: ignore[union-attr]
+    if not year_data or not isinstance(year_data, dict):
         yield Result(
             state=State.UNKNOWN,
             summary="{} | No entry for SQL Server {} in cache".format(summary_base, year),
+        )
+        return
+
+    # Determine which build target to use
+    build_target = params.get("build_target", "cu_gdr")
+    latest_build: Optional[str] = year_data.get(build_target) or year_data.get("cu_gdr") or year_data.get("cu")
+    build_target_label = "CU + GDR" if build_target == "cu_gdr" else "CU"
+
+    if not latest_build:
+        yield Result(
+            state=State.UNKNOWN,
+            summary="{} | No build data for SQL Server {}".format(summary_base, year),
         )
         return
 
@@ -306,11 +320,11 @@ def check_mssql_version_check(
 
     if installed_tuple >= latest_tuple:
         state   = State.OK
-        verdict = "Up to date (latest build: {})".format(latest_build)
+        verdict = "Up to date (latest {}: {})".format(build_target_label, latest_build)
     else:
         levels_mode = params.get("levels_mode", "warn_if_outdated")
         state   = State.CRIT if levels_mode == "crit_if_outdated" else State.WARN
-        verdict = "Update available - latest build: {}".format(latest_build)
+        verdict = "Update available - latest {}: {}".format(build_target_label, latest_build)
 
     yield Result(state=state, summary="{} | {}".format(summary_base, verdict))
 
@@ -323,12 +337,12 @@ def check_mssql_version_check(
     if cache_error:
         yield Result(state=State.WARN, notice=cache_error)
 
-    yield Result(state=State.OK, notice="Latest available build ({}): {}".format(year, latest_build))
+    if year_data.get("cu"):
+        yield Result(state=State.OK, notice="Latest CU:       {}".format(year_data["cu"]))
+    if year_data.get("cu_gdr"):
+        yield Result(state=State.OK, notice="Latest CU + GDR: {}".format(year_data["cu_gdr"]))
     yield Result(state=State.OK, notice="Installed build: {}".format(version))
-    yield Result(
-        state=State.OK,
-        notice="Build data source: learn.microsoft.com (official)",
-    )
+    yield Result(state=State.OK, notice="Build data source: learn.microsoft.com (official)")
 
 
 # ---------------------------------------------------------------------------
@@ -346,6 +360,6 @@ check_plugin_mssql_version_check = CheckPlugin(
     service_name="MSSQL %s Version",
     discovery_function=discover_mssql_version_check,
     check_function=check_mssql_version_check,
-    check_default_parameters={"levels_mode": "warn_if_outdated"},
+    check_default_parameters={"levels_mode": "warn_if_outdated", "build_target": "cu_gdr"},
     check_ruleset_name="mssql_version_check",
 )

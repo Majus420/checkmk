@@ -7,14 +7,28 @@ CheckMK MKP — Monitors installed Microsoft SQL Server versions per instance an
 One service `MSSQL <instance> Version` is created per SQL Server instance, e.g.:
 
 ```
-OK   MSSQL MSSQLSERVER Version   Version: Microsoft SQL Server 2025 (RTM) (17.0.1000.7) - Enterprise Evaluation Edition (64-bit) | Up to date (latest build: 17.0.1000.7)
-OK   MSSQL DIAMANTP Version      Version: Microsoft SQL Server 2022 (RTM) (16.0.4255.1) - Standard Edition (64-bit) | Up to date (latest build: 16.0.4255.1)
-WARN MSSQL BIKE Version          Version: Microsoft SQL Server 2022 (RTM) (16.0.4245.2) - Standard Edition (64-bit) | Update available - latest build: 16.0.4255.1
+OK   MSSQL MSSQLSERVER Version   Version: Microsoft SQL Server 2025 (RTM) (17.0.4045.5) - Enterprise Evaluation Edition (64-bit) | Up to date (latest CU + GDR: 17.0.4045.5)
+OK   MSSQL DIAMANTP Version      Version: Microsoft SQL Server 2022 (RTM) (16.0.4255.1) - Standard Edition (64-bit) | Up to date (latest CU + GDR: 16.0.4255.1)
+WARN MSSQL BIKE Version          Version: Microsoft SQL Server 2022 (RTM) (16.0.4245.2) - Standard Edition (64-bit) | Update available - latest CU + GDR: 16.0.4255.1
 ```
 
 The latest build numbers are fetched automatically from the **official Microsoft Learn documentation** and cached at `$OMD_ROOT/var/check_mk/mssql_latest_builds.json`. The cache refreshes once per day automatically — no cronjob required.
 
 Supported SQL Server versions: **2014, 2016, 2017, 2019, 2022, 2025**
+
+## CU vs CU + GDR
+
+Microsoft publishes two types of updates:
+
+- **CU (Cumulative Update)** — regular feature and bug fix updates
+- **GDR (General Distribution Release)** — security patches on top of a CU
+
+Both are cached separately. Via the WATO rule you can choose which one to use as reference:
+
+| Setting | Reference build | Effect |
+|---|---|---|
+| Latest CU | e.g. `15.0.4430.1` | Hosts on CU without GDR are OK |
+| Latest CU + GDR *(default)* | e.g. `15.0.4470.1` | Hosts without the latest security patch are WARN/CRIT |
 
 ## Data source
 
@@ -23,7 +37,7 @@ Official Microsoft Learn build version pages:
 - `https://learn.microsoft.com/en-us/troubleshoot/sql/releases/sqlserver-2019/build-versions`
 - (and so on for each supported version)
 
-The pages are parsed for the `(Latest)` marker in the CU table. If the marker is not found, the highest build number on the page is used as fallback.
+Note: Microsoft Learn may take a few days to mark a new build as "latest" after release. This plugin always takes the highest build number found on the page regardless of the marker, so it stays current.
 
 ## Requirements
 
@@ -41,12 +55,12 @@ mssql_version_check/
 │   ├── agent_based/
 │   │   └── mssql_version_check.py         # Main plugin: parse, discovery, check logic
 │   ├── rulesets/
-│   │   └── mssql_version_check.py         # WATO rule: WARN vs CRIT for outdated versions
+│   │   └── mssql_version_check.py         # WATO rule: state, CU vs CU+GDR
 │   └── checkman/
 │       └── mssql_version_check            # Inline help shown in the CMK UI
 ├── info                                   # MKP metadata (Python dict)
 ├── info.json                              # MKP metadata (JSON)
-└── mssql_version_check-1_0_19.mkp        # Ready-to-install MKP
+└── mssql_version_check-1_0_21.mkp        # Ready-to-install MKP
 ```
 
 ## Installation
@@ -61,8 +75,8 @@ mssql_version_check/
 ### Via CLI
 
 ```bash
-mkp add mssql_version_check-1_0_19.mkp
-mkp enable mssql_version_check 1.0.17
+mkp add mssql_version_check-1_0_21.mkp
+mkp enable mssql_version_check 1.0.21
 cmk -II <hostname>
 ```
 
@@ -78,9 +92,10 @@ python3 ~/local/bin/mssql_fetch_builds.py
 
 ## WATO rule
 
-Under **Setup → Service monitoring rules → MSSQL Version (online update check)** you can configure per host or instance whether an outdated version triggers `WARN` or `CRIT`.
+Under **Setup → Service monitoring rules → MSSQL Version (online update check)** you can configure per host or instance:
 
-Default: `WARN`
+- Whether an outdated version triggers `WARN` or `CRIT` (default: `WARN`)
+- Whether to compare against the latest **CU** or the latest **CU + GDR** (default: `CU + GDR`)
 
 ## Author
 

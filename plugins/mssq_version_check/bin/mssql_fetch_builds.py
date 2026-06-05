@@ -6,6 +6,10 @@ mssql_fetch_builds.py
 Fetches the latest available Microsoft SQL Server build numbers from the
 official Microsoft Learn documentation and writes them to the CheckMK cache.
 
+Two build numbers are cached per version:
+  - latest_cu:     Latest Cumulative Update (CU) only
+  - latest_cu_gdr: Latest CU + GDR (highest available build incl. security patches)
+
 Source:
   https://learn.microsoft.com/en-us/troubleshoot/sql/releases/sqlserver-{year}/build-versions
 
@@ -40,11 +44,15 @@ MSLEARN_URL = (
 CACHE_RELPATH = "var/check_mk/mssql_latest_builds.json"
 HTTP_TIMEOUT  = 20
 
-_LATEST_ROW_RE = re.compile(
-    r"<td>[^<]*\(Latest\)[^<]*</td>\s*<td>([\d]+\.[\d]+\.[\d]+\.[\d]+)</td>",
+# Matches CU-only rows (no GDR): <td>CU25</td> or <td>CU32 (Latest)</td>
+# Excludes rows containing "GDR"
+_CU_BUILD_RE = re.compile(
+    r"<td>CU\d+(?:\s*\([^)]*\))?</td>\s*<td>(1[2-7]\.0\.\d+\.\d+)</td>",
     re.IGNORECASE,
 )
-_BUILD_RE = re.compile(r"<td>(1[2-7]\.0\.\d+\.\d+)</td>")
+
+# Matches all builds (CU, CU+GDR, GDR) — just any valid build number in a <td>
+_ALL_BUILD_RE = re.compile(r"<td>(1[2-7]\.0\.(\d{3,})\.\d+)</td>")
 
 
 # ---------------------------------------------------------------------------
@@ -63,7 +71,8 @@ def version_tuple(v: str) -> Tuple[int, ...]:
         return (0,)
 
 
-def fetch_latest_build(year: str) -> Optional[str]:
+def fetch_builds(year: str) -> Tuple[Optional[str], Optional[str]]:
+    """Returns (latest_cu, latest_cu_gdr) for the given SQL Server year."""
     url = MSLEARN_URL.format(year=year)
     try:
         req = urllib.request.Request(
@@ -77,20 +86,20 @@ def fetch_latest_build(year: str) -> Optional[str]:
             content = resp.read().decode("utf-8", errors="replace")
     except Exception as exc:
         log("  ERROR fetching data for {}: {}".format(year, exc))
-        return None
+        return None, None
 
-    # Try (Latest) marker first
-    match = _LATEST_ROW_RE.search(content)
-    if match:
-        return match.group(1)
+    # Latest CU only (no GDR)
+    cu_builds = [m.group(1) for m in _CU_BUILD_RE.finditer(content)]
+    latest_cu = max(cu_builds, key=version_tuple) if cu_builds else None
 
-    # Fallback: highest build number found on page
-    builds = [m.group(1) for m in _BUILD_RE.finditer(content)]
-    if builds:
-        return max(builds, key=version_tuple)
+    # Highest build overall (CU + GDR)
+    all_builds = [m.group(1) for m in _ALL_BUILD_RE.finditer(content)]
+    latest_cu_gdr = max(all_builds, key=version_tuple) if all_builds else None
 
-    log("  WARNING: No valid build numbers found for SQL Server {}".format(year))
-    return None
+    if not latest_cu and not latest_cu_gdr:
+        log("  WARNING: No valid build numbers found for SQL Server {}".format(year))
+
+    return latest_cu, latest_cu_gdr
 
 
 def cache_path() -> str:
@@ -112,15 +121,20 @@ def main() -> int:
     log("Starting MSSQL build fetch (source: learn.microsoft.com)")
     log("Fetching SQL Server versions: {}".format(", ".join(SQL_VERSIONS)))
 
-    result: Dict[str, str] = {}
-    errors: List[str]      = []
+    result: Dict[str, Dict[str, str]] = {}
+    errors: List[str] = []
 
     for year in SQL_VERSIONS:
         log("  Fetching SQL Server {}...".format(year))
-        build = fetch_latest_build(year)
-        if build:
-            result[year] = build
-            log("  SQL Server {}: latest build = {}".format(year, build))
+        latest_cu, latest_cu_gdr = fetch_builds(year)
+        if latest_cu or latest_cu_gdr:
+            result[year] = {}
+            if latest_cu:
+                result[year]["cu"] = latest_cu
+                log("  SQL Server {}: latest CU       = {}".format(year, latest_cu))
+            if latest_cu_gdr:
+                result[year]["cu_gdr"] = latest_cu_gdr
+                log("  SQL Server {}: latest CU + GDR = {}".format(year, latest_cu_gdr))
         else:
             errors.append(year)
 
@@ -131,7 +145,7 @@ def main() -> int:
     if errors:
         log("WARNING: Could not fetch data for: {}".format(", ".join(errors)))
 
-    result["_fetched_at"] = datetime.now(timezone.utc).isoformat()
+    result["_fetched_at"] = datetime.now(timezone.utc).isoformat()  # type: ignore[assignment]
 
     if args.show:
         print(json.dumps(result, indent=2))

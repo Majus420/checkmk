@@ -7,7 +7,7 @@
                                    'mssql_version_check/checkman/mssql_version_check']},
  'name': 'mssql_version_check',
  'title': 'MSSQL Version Check (Online Update Check)',
- 'version': '1.0.19',
+ 'version': '1.0.21',
  'version.min_required': '2.4.0',
  'version.packaged': '2.4.0p29',
  'version.usable_until': None}
