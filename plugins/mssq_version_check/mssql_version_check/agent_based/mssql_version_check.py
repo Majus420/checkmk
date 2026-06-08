@@ -350,8 +350,8 @@ def check_mssql_version_check(
 # ---------------------------------------------------------------------------
 
 agent_section_mssql_version_check = AgentSection(
-    name="mssql_instance",
-    parsed_section_name="mssql_version_check",
+    name="mssql_version_check",
+    supersedes=["mssql_instance"],
     parse_function=parse_mssql_version_check,
 )
 
