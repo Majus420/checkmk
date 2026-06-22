@@ -2,9 +2,29 @@
 # -*- coding: utf-8 -*-
 # CheckMK 2.4 Check Plugin: mssql_version_check
 #
-# Source: mssql_instance section
-#   <instance>|config|<version>|<edition>|          <- older/RTM version
-#   <instance>|details|<version>|<patch>|<edition>  <- actual installed version (preferred)
+# Author: Marius Gielnik (Comramo)
+#
+# IMPORTANT: This plugin does NOT define its own AgentSection for "mssql_instance".
+# CheckMK ships a built-in AgentSection for that raw section name
+# (cmk.plugins.mssql.agent_based.mssql_instance:agent_section_mssql_instance).
+# Only one parse_function may exist per raw section name - declaring a second one
+# here previously collided with it ("plug-in 'mssql_instance' already defined"),
+# which silently broke the official "MS SQL: General State" check and the
+# MSSQL HW/SW inventory on every host using this MKP.
+#
+# Instead, this plugin subscribes to the already-parsed official section
+# (sections=["mssql_instance"]) and adapts its Mapping[str, Mapping[str, str]]
+# format itself - exactly the pattern CheckMK's own docs describe for extending
+# an existing section ("other check plug-ins can also subscribe to this section").
+#
+# Official section content per instance (see cmk/plugins/mssql/agent_based/mssql_instance.py):
+#   state               "1" = connected ok, "0"/missing = connection failed
+#   error_msg           connection error text (only meaningful when state != "1")
+#   config_version      RTM version from the registry (always present if config line was sent)
+#   config_edition      edition string from the registry
+#   details_version     actual live version queried from the running instance (preferred)
+#   details_edition      patch label (e.g. "RTM") - despite the name, NOT a SQL edition
+#   details_edition_long  the actual SQL edition string (e.g. "Standard Edition (64-bit)")
 #
 # Build data source: Microsoft Learn (official)
 #   https://learn.microsoft.com/en-us/troubleshoot/sql/releases/sqlserver-{year}/build-versions
@@ -23,18 +43,20 @@ import os
 import re
 import time
 import urllib.request
+from collections.abc import Mapping
 from typing import Any, Dict, List, NamedTuple, Optional, Tuple
 
 from cmk.agent_based.v2 import (
-    AgentSection,
     CheckPlugin,
     CheckResult,
     DiscoveryResult,
     Result,
     Service,
     State,
-    StringTable,
 )
+
+# Matches the official mssql_instance.py Section type exactly.
+OfficialSection = Mapping[str, Mapping[str, str]]
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -90,6 +112,7 @@ class MSSQLInstanceInfo(NamedTuple):
     patch:    str
     year:     str
     source:   str  # "details" or "config"
+    connection_error: str = ""  # set when the agent failed to query the live instance
 
 
 # ---------------------------------------------------------------------------
@@ -187,58 +210,52 @@ def _load_or_refresh_cache() -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
 
 
 # ---------------------------------------------------------------------------
-# Helpers
+# Adapt the official mssql_instance section to our own model.
+# This replaces the old parse_function - it is called directly from
+# discovery/check instead of being registered via AgentSection, so it never
+# competes with the built-in parser for the "mssql_instance" raw section.
 # ---------------------------------------------------------------------------
 
-def _strip_mssql_prefix(instance: str) -> str:
-    if instance.upper().startswith("MSSQL_"):
-        return instance[6:]
-    return instance
+def _extract_instance_info(instance_id: str, attrs: Mapping[str, str]) -> Optional[MSSQLInstanceInfo]:
+    has_details = "details_version" in attrs
+    raw_version = attrs.get("details_version") or attrs.get("config_version")
+    if not raw_version:
+        return None
+
+    # Robust extraction of the standalone version string (e.g. 17.0.4055.5).
+    # Prevents strings with nested hyphens/KB details from breaking the major version logic.
+    version_match = re.search(r"\b(1[2-7]\.0\.\d+\.\d+)\b", raw_version)
+    version = version_match.group(1) if version_match else raw_version
+
+    major = version.split(".")[0]
+    year  = _MAJOR_TO_YEAR.get(major)
+    if not year:
+        return None
+
+    source  = "details" if has_details else "config"
+    edition = attrs.get("details_edition_long") or attrs.get("config_edition", "")
+    # NB: the official section names the patch label (e.g. "RTM") "details_edition" -
+    # the real SQL edition string lives in "details_edition_long".
+    patch   = attrs.get("details_edition", "") if has_details else ""
+
+    connection_error = ""
+    if not has_details and attrs.get("state") != "1":
+        message = attrs.get("error_msg", "")
+        error_match = re.search(r"ERROR:\s*(.+)$", message)
+        connection_error = error_match.group(1).strip() if error_match else (message or "connection failed")
+
+    return MSSQLInstanceInfo(
+        instance=instance_id, version=version, edition=edition,
+        patch=patch, year=year, source=source, connection_error=connection_error,
+    )
 
 
-# ---------------------------------------------------------------------------
-# Parse mssql_instance section
-# ---------------------------------------------------------------------------
-
-def parse_mssql_version_check(string_table: StringTable) -> Dict[str, MSSQLInstanceInfo]:
-    details: Dict[str, MSSQLInstanceInfo] = {}
-    config:  Dict[str, MSSQLInstanceInfo] = {}
-
-    for row in string_table:
-        if len(row) < 3:
-            continue
-        instance = _strip_mssql_prefix(row[0].strip())
-        row_type = row[1]
-        version  = row[2].strip()
-        if not version:
-            continue
-        major = version.split(".")[0]
-        year  = _MAJOR_TO_YEAR.get(major)
-        if not year:
-            continue
-
-        if row_type == "details":
-            patch   = row[3].strip() if len(row) > 3 else ""
-            edition = row[4].strip() if len(row) > 4 else ""
-            info = MSSQLInstanceInfo(
-                instance=instance, version=version, edition=edition,
-                patch=patch, year=year, source="details",
-            )
-            if instance not in details or _version_tuple(version) > _version_tuple(details[instance].version):
-                details[instance] = info
-
-        elif row_type == "config":
-            edition = row[3].strip() if len(row) > 3 else ""
-            info = MSSQLInstanceInfo(
-                instance=instance, version=version, edition=edition,
-                patch="", year=year, source="config",
-            )
-            if instance not in config or _version_tuple(version) > _version_tuple(config[instance].version):
-                config[instance] = info
-
+def _build_instances(section: OfficialSection) -> Dict[str, MSSQLInstanceInfo]:
     result: Dict[str, MSSQLInstanceInfo] = {}
-    for inst in set(details) | set(config):
-        result[inst] = details.get(inst) or config[inst]  # type: ignore[assignment]
+    for instance_id, attrs in section.items():
+        info = _extract_instance_info(instance_id, attrs)
+        if info is not None:
+            result[instance_id] = info
     return result
 
 
@@ -246,10 +263,8 @@ def parse_mssql_version_check(string_table: StringTable) -> Dict[str, MSSQLInsta
 # Discovery
 # ---------------------------------------------------------------------------
 
-def discover_mssql_version_check(
-    section: Dict[str, MSSQLInstanceInfo],
-) -> DiscoveryResult:
-    for instance in section:
+def discover_mssql_version_check(section: OfficialSection) -> DiscoveryResult:
+    for instance in _build_instances(section):
         yield Service(item=instance)
 
 
@@ -260,13 +275,15 @@ def discover_mssql_version_check(
 def check_mssql_version_check(
     item: str,
     params: Dict[str, Any],
-    section: Dict[str, MSSQLInstanceInfo],
+    section: OfficialSection,
 ) -> CheckResult:
-    if item not in section:
+    instances = _build_instances(section)
+
+    if item not in instances:
         yield Result(state=State.UNKNOWN, summary="Instance {} not found in agent data".format(item))
         return
 
-    info    = section[item]
+    info    = instances[item]
     version = info.version
     year    = info.year
     edition = info.edition or _YEAR_TO_PRODUCT.get(year, "SQL Server {}".format(year))
@@ -329,10 +346,18 @@ def check_mssql_version_check(
     yield Result(state=state, summary="{} | {}".format(summary_base, verdict))
 
     if info.source == "config":
-        yield Result(
-            state=State.OK,
-            notice="Version source: mssql_instance config line (version may reflect RTM, not actual CU)",
-        )
+        if info.connection_error:
+            yield Result(
+                state=State.WARN,
+                notice="Agent could not query live version (using RTM from registry instead): {}".format(
+                    info.connection_error
+                ),
+            )
+        else:
+            yield Result(
+                state=State.OK,
+                notice="Version source: mssql_instance config line (version may reflect RTM, not actual CU)",
+            )
 
     if cache_error:
         yield Result(state=State.WARN, notice=cache_error)
@@ -347,16 +372,16 @@ def check_mssql_version_check(
 
 # ---------------------------------------------------------------------------
 # Registration
+#
+# Deliberately NO AgentSection() here - we subscribe to the section the
+# built-in cmk.plugins.mssql.agent_based.mssql_instance plugin already
+# registers for raw section "mssql_instance" (parsed_section_name defaults
+# to the same name since the built-in doesn't override it).
 # ---------------------------------------------------------------------------
-
-agent_section_mssql_version_check = AgentSection(
-    name="mssql_instance",
-    parsed_section_name="mssql_version_check",
-    parse_function=parse_mssql_version_check,
-)
 
 check_plugin_mssql_version_check = CheckPlugin(
     name="mssql_version_check",
+    sections=["mssql_instance"],
     service_name="MSSQL %s Version",
     discovery_function=discover_mssql_version_check,
     check_function=check_mssql_version_check,

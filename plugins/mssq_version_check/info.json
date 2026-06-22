@@ -1,6 +1,6 @@
 {
   "author": "Marius Gielnik",
-  "description": "Monitors installed MSSQL version per instance and checks for available updates (CU/GDR) via Microsoft Learn.",
+  "description": "Monitors installed MSSQL version per instance and checks for available updates (CU/GDR) via Microsoft Learn. No longer defines its own AgentSection for mssql_instance - subscribes to the built-in section instead, fixing a registration collision that was breaking the official MS SQL General State check and the MSSQL HW/SW inventory. Surfaces the agent-side connection error as a WARN notice when the live version cannot be queried.",
   "download_url": "https://git.comramo.net/Monitoring/mssql_version_check",
   "files": {
     "cmk_addons_plugins": [
@@ -11,7 +11,7 @@
   },
   "name": "mssql_version_check",
   "title": "MSSQL Version Check (Online Update Check)",
-  "version": "1.0.24",
+  "version": "1.0.27",
   "version.min_required": "2.4.0",
   "version.packaged": "2.4.0p29",
   "version.usable_until": null
