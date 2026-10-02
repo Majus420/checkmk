@@ -1,0 +1,45 @@
+#!/bin/sh
+# Checkmk agent plug-in: docker_cpu_normalized (Linux)
+# Author: Marius Gielnik
+# License: GNU General Public License v2 or later
+#
+# Reports the CPU utilization of every running Docker container as piggyback
+# data, together with the number of host CPUs and the container CPU limit, so
+# that Checkmk can normalize the value. Piggyback host names follow the option
+# container_id of mk_docker.py (docker.cfg), default "short".
+# Dependencies: docker CLI, awk, sed (no jq, no Python).
+
+command -v docker >/dev/null 2>&1 || exit 0
+
+CFG="${MK_CONFDIR:-/etc/check_mk}/docker.cfg"
+MODE=short
+if [ -r "$CFG" ]; then
+    V=$(sed -n 's/^[[:space:]]*container_id[[:space:]]*[:=][[:space:]]*//p' "$CFG" | tail -n 1 | tr -d '[:space:]')
+    [ -n "$V" ] && MODE=$V
+fi
+
+HOST_CPUS=$(docker info --format '{{.NCPU}}' 2>/dev/null)
+case "$HOST_CPUS" in
+'' | *[!0-9]*) HOST_CPUS=$(nproc 2>/dev/null || getconf _NPROCESSORS_ONLN 2>/dev/null || echo 1) ;;
+esac
+NODE=$(uname -n)
+
+docker stats --no-stream --format '{{.ID}};{{.CPUPerc}}' 2>/dev/null |
+    while IFS=';' read -r ID CPU; do
+        CPU=${CPU%\%}
+        case "$CPU" in '' | *[!0-9.]*) continue ;; esac
+        INSPECT=$(docker inspect --format '{{.Id}};{{.Name}};{{.HostConfig.NanoCpus}};{{.HostConfig.CpuQuota}};{{.HostConfig.CpuPeriod}};{{.HostConfig.CpuCount}}' "$ID" 2>/dev/null) || continue
+        echo "$INSPECT" | awk -F';' -v cpu="$CPU" -v hostcpus="$HOST_CPUS" -v mode="$MODE" -v node="$NODE" '
+        {
+            name = $2; sub(/^\//, "", name)
+            if (mode == "name")          target = name
+            else if (mode == "long")     target = $1
+            else if (mode == "combined") target = node "_" name
+            else                         target = substr($1, 1, 12)
+            limit = 0
+            if ($3 + 0 > 0)                      limit = $3 / 1000000000
+            else if ($4 + 0 > 0 && $5 + 0 > 0)   limit = $4 / $5
+            else if ($6 + 0 > 0)                 limit = $6
+            printf "<<<<%s>>>>\n<<<docker_cpu_normalized:sep(59)>>>\n%s;%s;%.3f\n<<<<>>>>\n", target, cpu, hostcpus, limit
+        }'
+    done

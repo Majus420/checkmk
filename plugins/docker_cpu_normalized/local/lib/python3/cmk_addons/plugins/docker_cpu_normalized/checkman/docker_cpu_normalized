@@ -1,0 +1,28 @@
+title: Docker Container: CPU Utilization (normalized)
+agents: linux, windows
+catalog: app/docker
+license: GPLv2
+distribution: check_mk
+description:
+ Monitors the CPU utilization of a Docker container in percent of the CPUs
+ available to it. {docker stats} reports 100 % per fully used CPU core, so
+ a container on a 72-core host can show values up to 7200 %. This check
+ divides by the number of host CPUs, or by the container CPU limit if one is
+ set ({--cpus}), and therefore stays between 0 and 100 %.
+
+ The data comes from the agent plug-in {docker_cpu_normalized}, which is
+ deployed with the Agent Bakery rule {Docker container CPU utilization
+ (normalized)}. On Windows, where {docker stats} already reports the share of
+ all CPUs, the plug-in converts the value so that both platforms behave the
+ same.
+
+ The levels can be configured with the rule {Docker container CPU
+ utilization (normalized)}. By default the service alarms only if the
+ utilization stays at or above 90 % for 1 h 30 min (WARN) or 3 h (CRIT).
+ Immediate levels can be enabled additionally.
+
+discovery:
+ One service is created on every Docker container host that receives the
+ section {docker_cpu_normalized} from the agent plug-in. Without the agent plug-in
+ the service is created from the standard Docker data on hosts matched by the
+ discovery rule {Docker container CPU utilization (normalized)}.

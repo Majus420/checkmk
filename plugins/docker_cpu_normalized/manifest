@@ -1,0 +1,37 @@
+{'author': 'Marius Gielnik',
+ 'description': 'Docker container CPU utilization normalized to the CPUs '
+                'available to the container (host CPUs or container CPU '
+                'limit), so the value stays between 0 and 100 %. Includes '
+                'agent plug-in for Linux and Windows, Agent Bakery rule, WebUI '
+                'levels rule, metric and man page. Requires Checkmk 2.5.0 or '
+                'newer.',
+ 'download_url': '',
+ 'files': {'agent_based': [],
+           'agents': ['plugins/docker_cpu_normalized',
+                      'windows/plugins/docker_cpu_normalized.ps1'],
+           'alert_handlers': [],
+           'bin': [],
+           'checkman': [],
+           'checks': [],
+           'cmk_addons_plugins': ['docker_cpu_normalized/agent_based/docker_cpu_normalized.py',
+                                  'docker_cpu_normalized/bakery/docker_cpu_normalized.py',
+                                  'docker_cpu_normalized/graphing/docker_cpu_normalized.py',
+                                  'docker_cpu_normalized/rulesets/docker_cpu_normalized.py',
+                                  'docker_cpu_normalized/checkman/docker_cpu_normalized'],
+           'cmk_plugins': [],
+           'doc': ['docker_cpu_normalized/README.md', 'docker_cpu_normalized/LICENSE'],
+           'ec_rule_packs': [],
+           'gui': [],
+           'inventory': [],
+           'lib': [],
+           'locales': [],
+           'mibs': [],
+           'notifications': [],
+           'pnp-templates': [],
+           'web': []},
+ 'name': 'docker_cpu_normalized',
+ 'title': 'Docker CPU utilization (normalized)',
+ 'version': '1.2.1',
+ 'version.min_required': '2.5.0',
+ 'version.packaged': '2.5.0',
+ 'version.usable_until': None}
