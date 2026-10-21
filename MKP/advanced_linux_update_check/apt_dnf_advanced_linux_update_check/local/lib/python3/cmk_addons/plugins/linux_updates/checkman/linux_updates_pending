@@ -1,0 +1,24 @@
+title: Linux: Pending updates with zero-day, critical, security and normal tiers
+agents: linux
+catalog: os/misc
+license: GPLv2
+distribution: check_mk
+description:
+ Evaluates pending package updates on Debian/Ubuntu (apt), RHEL family and
+ Fedora (dnf, yum) and SUSE (zypper), collected by the agent plug-in
+ linux_updates (Agent Bakery rule "APT/DNF/Zypper: Linux update check (agent plug-in)").
+ Nothing is installed. Every update is put into one tier: zero-day (fixes a
+ CVE listed in the CISA KEV catalog), critical (high severity or EPSS above
+ threshold), security or normal. Zero-day and critical can be switched off.
+ Each tier has its own delay, counted from the time the agent first saw the
+ package version, its own state and an optional escalation. CVEs come from
+ the distribution advisories (dnf/yum/zypper) or from OSV data (apt); KEV,
+ EPSS and OSV data are created by linux_updates_threatdb on the site.
+ Pending snap and flatpak updates are shown as additional information.
+
+discovery:
+ One service is created on each host that sends the linux_updates section, named
+ after its package manager (APT, DNF, YUM or Zypper).
+
+item:
+ The package manager: APT, DNF, YUM or Zypper.

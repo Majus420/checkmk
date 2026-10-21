@@ -1,0 +1,721 @@
+#!/bin/sh
+# -----------------------------------------------------------------------------
+# linux_updates - Checkmk agent plug-in for package updates on Linux
+#                 Debian/Ubuntu (apt), RHEL family/Fedora (dnf, yum), SUSE (zypper)
+#
+# Author:   Marius Gielnik
+# Project:  https://github.com/Majus420/checkmk/tree/main/MKP/advanced_linux_update_check
+# Version:  1.3.0
+# License:  GPL-2.0-or-later
+#
+# Purpose:  Collects everything the "linux_updates" check plug-ins need:
+#           - pending updates with installed/target version, source package,
+#             repository and security information
+#               apt:    simulated "apt-get upgrade" AND "apt-get dist-upgrade"
+#                       (kept back, phased, new, removed packages)
+#               dnf:    repoquery --upgrades + updateinfo (advisory, severity, CVEs)
+#               yum:    check-update + updateinfo (EL7)
+#               zypper: list-updates + security patches (severity, CVEs)
+#             nothing is ever installed
+#           - first-seen time per package + target version (state file on the
+#             host, survives Checkmk restarts and site moves)
+#           - refresh of the package metadata with a hard minimum interval,
+#             its errors and the metadata age
+#           - repositories, held/locked, autoremovable, orphaned packages,
+#             package database consistency, automatic updates, last upgrade
+#           - reboot required, services needing a restart, kernel livepatches
+#           - pending snap/flatpak updates (cached, only with refresh=auto)
+#
+# Deploy:   Agent Bakery rule "APT/DNF/Zypper: Linux update check (agent plug-in)"
+#           (Setup > Agents > Agent rules): asynchronous
+#           (cached, interval) or not deployed.
+# Config:   $MK_CONFDIR/linux_updates.cfg (written by the bakery)
+#             refresh=never|auto     refresh package metadata before the check
+#             min_refresh=14400      minimum seconds between refreshes (>=3600)
+#             refresh_timeout=300    timeout of the refresh in seconds
+# State:    $MK_VARDIR/linux_updates.seen          first-seen times
+#           $MK_VARDIR/linux_updates.apps          cached snap/flatpak updates
+#           $MK_VARDIR/linux_updates.refresh       last refresh attempt + status
+#           $MK_VARDIR/linux_updates.refresh.log   output of the last refresh
+# Network:  only the metadata refresh (refresh=auto) contacts the mirrors, and
+#           never more often than min_refresh - also when a mirror fails.
+#           All other queries use the local cache only.
+# Test:     on the host as root:  sh /usr/lib/check_mk_agent/plugins/*/linux_updates
+#           on the site:          cmk -d <host> | sed -n '/<<<linux_updates/,/<<<[^l]/p' | head
+# Removal:  set the bakery rule to "Do not deploy", bake + update agents;
+#           $MK_VARDIR/linux_updates.* may be deleted.
+# -----------------------------------------------------------------------------
+
+PLUGIN_VERSION="1.3.0"
+
+LC_ALL=C
+LANG=C
+export LC_ALL LANG
+
+CONFDIR="${MK_CONFDIR:-/etc/check_mk}"
+VARDIR="${MK_VARDIR:-/var/lib/check_mk_agent}"
+CFG="$CONFDIR/linux_updates.cfg"
+SEEN="$VARDIR/linux_updates.seen"
+REFRESH_STATE="$VARDIR/linux_updates.refresh"
+REFRESH_LOG="$VARDIR/linux_updates.refresh.log"
+REFRESH_OK="$VARDIR/linux_updates.refresh_ok"
+
+have() { command -v "$1" >/dev/null 2>&1; }
+
+is_int() {
+    case "$1" in '' | *[!0-9]*) return 1 ;; *) return 0 ;; esac
+}
+
+cfg_get() {
+    _v=""
+    if [ -r "$CFG" ]; then
+        _v=$(sed -n "s/^[[:space:]]*$1[[:space:]]*=[[:space:]]*//p" "$CFG" | tail -n 1 | tr -d '"'"'"'[:space:]')
+    fi
+    [ -n "$_v" ] && echo "$_v" || echo "$2"
+}
+
+mtime() {
+    # newest mtime of the given paths (globs allowed), 0 if none exists
+    _m=0
+    for _f in "$@"; do
+        [ -e "$_f" ] || continue
+        _t=$(stat -c %Y "$_f" 2>/dev/null)
+        is_int "$_t" && [ "$_t" -gt "$_m" ] && _m=$_t
+    done
+    echo "$_m"
+}
+
+# ----------------------------------------------------------------- backend
+BACKEND="${LINUX_UPDATES_BACKEND:-}"
+if [ -z "$BACKEND" ]; then
+    if have apt-get && have dpkg-query; then
+        BACKEND=apt
+    elif have dnf; then
+        BACKEND=dnf
+    elif have yum; then
+        BACKEND=yum
+    elif have zypper; then
+        BACKEND=zypper
+    else
+        exit 0
+    fi
+fi
+DNF5=0
+if [ "$BACKEND" = "dnf" ] && dnf --version 2>/dev/null | head -n 1 | grep -qi 'dnf5'; then
+    DNF5=1
+fi
+
+REFRESH=$(cfg_get refresh never)
+MIN_REFRESH=$(cfg_get min_refresh 14400)
+REFRESH_TIMEOUT=$(cfg_get refresh_timeout 300)
+is_int "$MIN_REFRESH" || MIN_REFRESH=14400
+[ "$MIN_REFRESH" -lt 3600 ] && MIN_REFRESH=3600
+is_int "$REFRESH_TIMEOUT" || REFRESH_TIMEOUT=300
+[ "$REFRESH_TIMEOUT" -lt 30 ] && REFRESH_TIMEOUT=30
+
+mkdir -p "$VARDIR" 2>/dev/null
+TMP=$(mktemp -d 2>/dev/null) || exit 0
+trap 'rm -rf "$TMP"' EXIT INT TERM
+
+NOW=$(date +%s)
+NICE=""
+have nice && NICE="nice -n 19"
+have ionice && NICE="$NICE ionice -c 3"
+TO=""
+have timeout && TO="timeout $REFRESH_TIMEOUT"
+
+# ---------------------------------------------------------------- OS / meta
+OS_ID=""
+OS_VER=""
+OS_CODE=""
+OS_LIKE=""
+if [ -r /etc/os-release ]; then
+    # shellcheck disable=SC1091
+    OS_ID=$(. /etc/os-release && echo "$ID")
+    # shellcheck disable=SC1091
+    OS_VER=$(. /etc/os-release && echo "$VERSION_ID")
+    # shellcheck disable=SC1091
+    OS_CODE=$(. /etc/os-release && echo "${VERSION_CODENAME:-$UBUNTU_CODENAME}")
+    # shellcheck disable=SC1091
+    OS_LIKE=$(. /etc/os-release && echo "$ID_LIKE")
+fi
+ARCH=$(uname -m)
+
+CONTAINER="none"
+if [ -f /.dockerenv ]; then
+    CONTAINER="docker"
+elif [ -f /run/.containerenv ]; then
+    CONTAINER="podman"
+elif [ -s /run/systemd/container ]; then
+    CONTAINER=$(head -n 1 /run/systemd/container)
+elif [ -r /proc/1/environ ] && tr '\0' '\n' </proc/1/environ 2>/dev/null | grep -q '^container='; then
+    CONTAINER=$(tr '\0' '\n' </proc/1/environ | sed -n 's/^container=//p' | head -n 1)
+fi
+
+# ------------------------------------------------------- metadata freshness
+cache_ts() {
+    case "$BACKEND" in
+        apt) mtime /var/lib/apt/periodic/update-success-stamp "$REFRESH_OK" /var/lib/apt/lists/partial ;;
+        dnf | yum) mtime "$REFRESH_OK" /var/cache/dnf/*/repodata/repomd.xml /var/cache/dnf/*.solv \
+            /var/cache/libdnf5/*/repodata/repomd.xml /var/cache/yum/*/*/*/repomd.xml /var/cache/yum/*/*/repomd.xml ;;
+        zypper) mtime "$REFRESH_OK" /var/cache/zypp/raw/*/repodata/repomd.xml /var/cache/zypp/solv/*/solv ;;
+    esac
+}
+
+run_refresh() {
+    # shellcheck disable=SC2086
+    case "$BACKEND" in
+        apt) $NICE $TO apt-get -q -o DPkg::Lock::Timeout=0 update ;;
+        dnf) $NICE $TO dnf -q -y makecache ;;
+        yum) $NICE $TO yum -q -y makecache fast ;;
+        zypper) $NICE $TO zypper --non-interactive --quiet refresh ;;
+    esac
+}
+
+LAST_ATTEMPT=0
+LAST_STATUS="never"
+if [ -r "$REFRESH_STATE" ]; then
+    read -r LAST_ATTEMPT LAST_STATUS <"$REFRESH_STATE"
+    is_int "$LAST_ATTEMPT" || LAST_ATTEMPT=0
+fi
+CACHE_TS=$(cache_ts)
+
+if [ "$REFRESH" = "auto" ]; then
+    if [ $((NOW - LAST_ATTEMPT)) -ge "$MIN_REFRESH" ] && [ $((NOW - CACHE_TS)) -ge "$MIN_REFRESH" ]; then
+        run_refresh >"$TMP/refresh.log" 2>&1
+        _rc=$?
+        if grep -qiE 'Could not get lock|Unable to lock|locked by|System management is locked|Waiting for process' "$TMP/refresh.log"; then
+            LAST_STATUS="locked"
+        elif [ "$_rc" -eq 124 ]; then
+            LAST_STATUS="timeout"
+        elif [ "$_rc" -ne 0 ] || grep -qiE '^(E:|Err:|Error|Failed|Problem|Curl error)' "$TMP/refresh.log"; then
+            LAST_STATUS="failed"
+        elif grep -qiE '^(W:|Warning)' "$TMP/refresh.log"; then
+            LAST_STATUS="warnings"
+        else
+            LAST_STATUS="ok"
+        fi
+        if [ "$LAST_STATUS" != "locked" ]; then
+            LAST_ATTEMPT=$NOW
+            echo "$LAST_ATTEMPT $LAST_STATUS" >"$REFRESH_STATE"
+            cp "$TMP/refresh.log" "$REFRESH_LOG" 2>/dev/null
+            case "$LAST_STATUS" in ok | warnings) touch "$REFRESH_OK" ;; esac
+        fi
+        CACHE_TS=$(cache_ts)
+    fi
+fi
+
+# ------------------------------------------------------------- collection
+# Every backend writes:
+#   $TMP/upd      kind|pkg|src|old|new|security|origin|severity|advisory|cves
+#   $TMP/extra    further section lines (rem, withheld, hold, autoremove,
+#                 orphan, repo, secinfo, audit, auto, restart, reboot)
+#   $TMP/msgs     raw warning/error lines
+: >"$TMP/upd"
+: >"$TMP/extra"
+: >"$TMP/msgs"
+[ -r "$REFRESH_LOG" ] && cat "$REFRESH_LOG" >>"$TMP/msgs"
+
+# ---------------------------------------------------------------- apt
+collect_apt() {
+    $NICE apt-get -s -o Debug::NoLocking=1 upgrade >"$TMP/up.out" 2>>"$TMP/msgs"
+    $NICE apt-get -s -o Debug::NoLocking=1 dist-upgrade >"$TMP/dist.out" 2>>"$TMP/msgs"
+    $NICE apt-get -s -o Debug::NoLocking=1 autoremove >"$TMP/autorm.out" 2>/dev/null
+
+    # Inst lines -> pkg|old|new|origins
+    _inst() {
+        awk '
+        /^Inst / {
+            pkg = $2; old = ""
+            if ($3 ~ /^\[/) { old = $3; gsub(/[][]/, "", old) }
+            p = index($0, "(")
+            if (p == 0) next
+            s = substr($0, p + 1)
+            sub(/\)( \[\])?[[:space:]]*$/, "", s)
+            nv = s; sub(/ .*/, "", nv)
+            org = s; sub(/^[^ ]* ?/, "", org); sub(/ ?\[[^]]*\]$/, "", org)
+            gsub(/\|/, "/", org)
+            print pkg "|" old "|" nv "|" org
+        }' "$1"
+    }
+    _block() {
+        awk -v hdr="$2" '
+        $0 ~ hdr { on = 1; next }
+        on && /^  / { for (i = 1; i <= NF; i++) print $i; next }
+        on { on = 0 }' "$1"
+    }
+    _inst "$TMP/up.out" >"$TMP/up.inst"
+    _inst "$TMP/dist.out" >"$TMP/dist.inst"
+    _block "$TMP/up.out" "deferred due to phasing" | sort -u >"$TMP/phased"
+    _block "$TMP/dist.out" "have been kept back" | sort -u >"$TMP/kept"
+
+    dpkg-query -W -f='${binary:Package}|${Package}|${Source}\n' 2>/dev/null |
+        awk -F'|' '{
+            src = $3; sub(/ .*/, "", src); if (src == "") src = $2
+            print $1 "|" src; if ($1 != $2) print $2 "|" src
+        }' | sort -u >"$TMP/srcmap"
+
+    awk -F'|' '
+        FILENAME == ARGV[1] { src[$1] = $2; next }
+        FILENAME == ARGV[2] { up[$1] = 1; next }
+        {
+            pkg = $1; old = $2; nv = $3; org = $4
+            if (old == "") kind = "new"; else if (pkg in up) kind = "up"; else kind = "dist"
+            sec = (org ~ /Debian-Security:|-security([ ,]|$)/) ? 1 : 0
+            s = (pkg in src) ? src[pkg] : pkg
+            print kind "|" pkg "|" s "|" old "|" nv "|" sec "|" org "|||"
+        }' "$TMP/srcmap" "$TMP/up.inst" "$TMP/dist.inst" >"$TMP/upd"
+
+    {
+        grep '^Remv ' "$TMP/dist.out" | awk '{v = $3; gsub(/[][]/, "", v); print "rem|" $2 "|" v}'
+        while read -r p; do echo "withheld|$p|phased"; done <"$TMP/phased"
+        while read -r p; do grep -qx "$p" "$TMP/phased" || echo "withheld|$p|kept_back"; done <"$TMP/kept"
+        apt-mark showhold 2>/dev/null | awk 'NF {print "hold|" $1}'
+        grep '^Remv ' "$TMP/autorm.out" | awk '{print "autoremove|" $2}'
+        if have apt; then
+            apt list --installed 2>/dev/null | awk -F/ '/\[installed,local\]/ {print "orphan|" $1}'
+        fi
+        apt-cache policy 2>/dev/null | awk '
+            /^ *-?[0-9]+ [a-z]+[a-z0-9+.-]*:\/\// { prio = $1; loc = $2 " " $3; next }
+            /^ +release / && loc != "" {
+                o = a = n = l = c = ""
+                line = $0; sub(/^ +release /, "", line)
+                k = split(line, f, ",")
+                for (i = 1; i <= k; i++) {
+                    split(f[i], kv, "=")
+                    if (kv[1] == "o") o = kv[2]
+                    else if (kv[1] == "a") a = kv[2]
+                    else if (kv[1] == "n") n = kv[2]
+                    else if (kv[1] == "l") l = kv[2]
+                    else if (kv[1] == "c") c = kv[2]
+                }
+                print "repo|" prio "|" loc "|" o "|" a "|" n "|" l "|" c
+                loc = ""
+            }' | sort -u
+        [ -s /etc/apt/trusted.gpg ] && echo "legacykey|1"
+        _a=$(dpkg --audit 2>/dev/null | grep -c '^ ')
+        _ap=$(dpkg --audit 2>/dev/null | grep '^ ' | head -n 3 | awk '{print $1}' | tr '\n' ' ' | sed 's/ $//')
+        apt-get check -q >/dev/null 2>&1 || _a=$((_a + 1))
+        echo "audit|$_a|$_ap"
+        _inst_uu=0
+        dpkg-query -W -f='${Status}' unattended-upgrades 2>/dev/null | grep -q 'install ok installed' && _inst_uu=1
+        _en=$(apt-config shell X APT::Periodic::Unattended-Upgrade 2>/dev/null | sed -n "s/^X='\(.*\)'$/\1/p")
+        _en1=0
+        [ -n "$_en" ] && [ "$_en" != "0" ] && _en1=1
+        _log=/var/log/unattended-upgrades/unattended-upgrades.log
+        _err=0
+        [ -r "$_log" ] && _err=$(awk '/Starting unattended upgrades script/ { e = 0 } / ERROR / { e++ } END { print e + 0 }' "$_log")
+        echo "auto|unattended-upgrades|$_inst_uu|$_en1|$(mtime "$_log")|$_err"
+        if have needrestart; then
+            needrestart -b -r l 2>/dev/null | sed -n 's/^NEEDRESTART-SVC: *//p' | awk 'NF {print "restart|" $1}'
+        fi
+        if [ -f /var/run/reboot-required ]; then
+            _pk=""
+            [ -r /var/run/reboot-required.pkgs ] && _pk=$(sort -u /var/run/reboot-required.pkgs | tr '\n' ',' | sed 's/,$//')
+            echo "reboot|flag|$(mtime /var/run/reboot-required)|$_pk"
+        fi
+        # last real upgrade (apt history)
+        _last=""
+        for _h in /var/log/apt/history.log /var/log/apt/history.log.1.gz; do
+            [ -r "$_h" ] || continue
+            case "$_h" in *.gz) _cat="zcat" ;; *) _cat="cat" ;; esac
+            _last=$($_cat "$_h" 2>/dev/null | awk '/^Start-Date:/ { d = $2 " " $3 } /^Upgrade:/ { last = d } END { print last }')
+            [ -n "$_last" ] && break
+        done
+        _lt=0
+        [ -n "$_last" ] && _lt=$(date -d "$_last" +%s 2>/dev/null || echo 0)
+        echo "lastupgrade|$_lt"
+    } >>"$TMP/extra"
+}
+
+# ---------------------------------------------------------------- rpm common
+rpm_installed() {
+    # name|arch|evr|srcname   (highest evr per name.arch)
+    rpm -qa --qf '%{NAME}|%{ARCH}|%{EPOCH}:%{VERSION}-%{RELEASE}|%{SOURCERPM}\n' 2>/dev/null |
+        sed 's/|(none):/|0:/' |
+        awk -F'|' '{
+            src = $4; sub(/-[^-]*-[^-]*\.(no)?src\.rpm$/, "", src); if (src == "" || src == "(none)") src = $1
+            print $1 "|" $2 "|" $3 "|" src
+        }' | sort -t'|' -k1,2 -k3V >"$TMP/installed"
+}
+
+# nevra -> name|arch|evr   (name-[epoch:]version-release.arch)
+nevra_split() {
+    awk '{
+        n = $0; arch = n; sub(/.*\./, "", arch); sub(/\.[^.]*$/, "", n)
+        rel = n; sub(/.*-/, "", rel); sub(/-[^-]*$/, "", n)
+        ver = n; sub(/.*-/, "", ver); sub(/-[^-]*$/, "", n)
+        ep = "0"; if (ver ~ /:/) { ep = ver; sub(/:.*/, "", ep); sub(/^[^:]*:/, "", ver) }
+        print n "|" arch "|" ep ":" ver "-" rel
+    }'
+}
+
+rpm_extras() {
+    _rt=$(rpm -qa --qf '%{INSTALLTIME}\n' 2>/dev/null | sort -n | tail -n 1)
+    echo "lastupgrade|${_rt:-0}"
+    for _t in dnf-automatic.timer dnf-automatic-install.timer dnf5-automatic.timer yum-cron.service transactional-update.timer; do
+        if have systemctl && systemctl list-unit-files "$_t" 2>/dev/null | grep -q "^$_t"; then
+            _e=0
+            systemctl is-enabled "$_t" >/dev/null 2>&1 && _e=1
+            echo "auto|${_t%.*}|1|$_e|0|0"
+            return
+        fi
+    done
+    if [ "$BACKEND" = "zypper" ]; then echo "auto|-|0|0|0|0"; else echo "auto|dnf-automatic|0|0|0|0"; fi
+}
+
+# ---------------------------------------------------------------- dnf
+collect_dnf() {
+    rpm_installed
+    _dnf="dnf -q -C"
+    _nl=""
+    [ "$DNF5" = "1" ] && _nl='\n'
+    # available upgrades: name|arch|evr|repo
+    # shellcheck disable=SC2086
+    $NICE $_dnf repoquery --upgrades --latest-limit=1 \
+        --qf "%{name}|%{arch}|%{epoch}:%{version}-%{release}|%{repoid}$_nl" 2>>"$TMP/msgs" |
+        grep '|' | sort -u >"$TMP/avail"
+
+    # advisories: ID  Severity/Type  NEVRA   (dnf4)  /  Name Type Severity Package Issued (dnf5)
+    if [ "$DNF5" = "1" ]; then
+        # shellcheck disable=SC2086
+        $NICE $_dnf advisory list --updates 2>>"$TMP/msgs" |
+            awk 'NR > 1 && NF >= 4 { print $1 "|" tolower($3) "|" tolower($2) "|" $4 }' >"$TMP/adv.raw"
+        # shellcheck disable=SC2086
+        $NICE $_dnf advisory list --updates --with-cve 2>>"$TMP/msgs" |
+            awk 'NR > 1 && $1 ~ /^CVE-/ { print $1 "|" $4 }' >"$TMP/cve.raw"
+    else
+        # shellcheck disable=SC2086
+        $NICE $_dnf updateinfo list --updates 2>>"$TMP/msgs" |
+            awk 'NF == 3 && ($2 ~ /\// || $2 ~ /^(Sec|Bugfix|Enhancement|bugfix|enhancement|security|newpackage|unspecified)/) {
+                    sev = ""; typ = $2
+                    if ($2 ~ /\//) { sev = $2; sub(/\/.*/, "", sev); typ = $2; sub(/.*\//, "", typ) }
+                    print $1 "|" tolower(sev) "|" tolower(typ) "|" $3
+                 }' >"$TMP/adv.raw"
+        # shellcheck disable=SC2086
+        $NICE $_dnf updateinfo list --updates --with-cve 2>>"$TMP/msgs" |
+            awk '$1 ~ /^CVE-/ && NF == 3 { print $1 "|" $3 }' >"$TMP/cve.raw"
+    fi
+    _advisory_join
+
+    # advisory metadata present at all?
+    # shellcheck disable=SC2086
+    _n=$($_dnf updateinfo list --all 2>/dev/null | grep -c . || true)
+    [ "$DNF5" = "1" ] && _n=$($_dnf advisory list --all 2>/dev/null | grep -c . || true)
+    if [ "${_n:-0}" -gt 0 ]; then echo "secinfo|1|$_n advisories"; else echo "secinfo|0|no advisory metadata"; fi >>"$TMP/extra"
+
+    {
+        # shellcheck disable=SC2086
+        if [ "$DNF5" = "1" ]; then
+            $_dnf versionlock list 2>/dev/null | awk 'NF && $1 !~ /^#/ {print "hold|" $1}'
+        else
+            $_dnf versionlock list 2>/dev/null | awk 'NF && $1 !~ /^(Last|#)/ {print "hold|" $1}'
+        fi
+        # shellcheck disable=SC2086
+        $NICE $_dnf repoquery --unneeded --qf "%{name}$_nl" 2>/dev/null | awk 'NF {print "autoremove|" $1}'
+        # shellcheck disable=SC2086
+        $NICE $_dnf repoquery --extras --qf "%{name}$_nl" 2>/dev/null | awk 'NF {print "orphan|" $1}'
+        # shellcheck disable=SC2086
+        $_dnf repolist --enabled 2>/dev/null | awk 'NR > 1 && NF {print "repo|-|" $1 "||||| "}'
+        # shellcheck disable=SC2086
+        _c=$($NICE dnf -q -C check 2>/dev/null | grep -c . || true)
+        echo "audit|${_c:-0}|"
+        rpm_extras
+        _nr=""
+        if dnf needs-restarting --help >/dev/null 2>&1; then _nr="dnf needs-restarting"
+        elif have needs-restarting; then _nr="needs-restarting"; fi
+        if [ -n "$_nr" ]; then
+            $_nr -r >"$TMP/nr.out" 2>/dev/null
+            if [ $? -eq 1 ]; then
+                echo "reboot|tool|0|$(grep -E '^ *\* ' "$TMP/nr.out" | sed 's/^ *\* //' | tr '\n' ',' | sed 's/,$//')"
+            fi
+            $_nr -s 2>/dev/null | awk 'NF == 1 && $1 ~ /^[A-Za-z0-9@._:-]+$/ {print "restart|" $1}'
+        fi
+    } >>"$TMP/extra"
+}
+
+# ---------------------------------------------------------------- yum (EL7)
+collect_yum() {
+    rpm_installed
+    # check-update: name.arch evr repo (long names wrap onto the next line)
+    $NICE yum -q -C check-update 2>>"$TMP/msgs" |
+        awk 'BEGIN { buf = "" }
+             /^Obsoleting/ { exit }
+             NF == 0 { next }
+             { line = (buf == "" ? $0 : buf " " $0); n = split(line, f, " ")
+               if (n < 3) { buf = line; next }
+               buf = ""; na = f[1]; arch = na; sub(/.*\./, "", arch); sub(/\.[^.]*$/, "", na)
+               evr = f[2]; if (evr !~ /:/) evr = "0:" evr
+               print na "|" arch "|" evr "|" f[3] }' | sort -u >"$TMP/avail"
+    $NICE yum -q -C updateinfo list updates 2>>"$TMP/msgs" |
+        awk 'NF == 3 { sev = ""; typ = $2
+                       if ($2 ~ /\//) { sev = $2; sub(/\/.*/, "", sev); typ = $2; sub(/.*\//, "", typ) }
+                       print $1 "|" tolower(sev) "|" tolower(typ) "|" $3 }' >"$TMP/adv.raw"
+    $NICE yum -q -C updateinfo list updates cves 2>>"$TMP/msgs" |
+        awk '$1 ~ /^CVE-/ && NF == 3 { print $1 "|" $3 }' >"$TMP/cve.raw"
+    _advisory_join
+    _n=$(yum -q -C updateinfo list all 2>/dev/null | grep -c . || true)
+    if [ "${_n:-0}" -gt 0 ]; then echo "secinfo|1|$_n advisories"; else echo "secinfo|0|no advisory metadata"; fi >>"$TMP/extra"
+    {
+        yum -q versionlock list 2>/dev/null | awk 'NF && $1 !~ /^(Loaded|versionlock)/ {print "hold|" $1}'
+        yum -q -C repolist enabled 2>/dev/null | awk 'NR > 1 && NF && $1 !~ /^repolist/ {print "repo|-|" $1 "||||| "}'
+        rpm_extras
+        if have needs-restarting; then
+            needs-restarting -r >/dev/null 2>&1
+            [ $? -eq 1 ] && echo "reboot|tool|0|"
+            needs-restarting -s 2>/dev/null | awk 'NF == 1 && $1 ~ /^[A-Za-z0-9@._:-]+$/ {print "restart|" $1}'
+        fi
+    } >>"$TMP/extra"
+}
+
+# join available upgrades with installed versions and advisories
+_advisory_join() {
+    # adv.raw: advisory|severity|type|nevra   cve.raw: cve|nevra
+    awk -F'|' '{ print $4 }' "$TMP/adv.raw" | nevra_split >"$TMP/adv.nevra"
+    paste -d'|' "$TMP/adv.raw" "$TMP/adv.nevra" >"$TMP/adv"
+    awk -F'|' '{ print $2 }' "$TMP/cve.raw" | nevra_split >"$TMP/cve.nevra"
+    paste -d'|' "$TMP/cve.raw" "$TMP/cve.nevra" >"$TMP/cve"
+    awk -F'|' '
+        FILENAME == ARGV[1] { inst[$1 "|" $2] = $3; src[$1 "|" $2] = $4; srcn[$1] = $4; next }
+        FILENAME == ARGV[2] {
+            # advisory|severity|type|nevra|name|arch|evr
+            k = $5 "|" $6
+            if (adv[k] == "") adv[k] = $1; else if (index("," adv[k] ",", "," $1 ",") == 0) adv[k] = adv[k] "," $1
+            if ($3 ~ /sec/) sec[k] = 1
+            if (rank($2) > rank(sev[k])) sev[k] = $2
+            next
+        }
+        FILENAME == ARGV[3] {
+            k = $3 "|" $4
+            if (cve[k] == "") cve[k] = $1; else if (index("," cve[k] ",", "," $1 ",") == 0) cve[k] = cve[k] "," $1
+            next
+        }
+        {
+            # name|arch|evr|repo
+            k = $1 "|" $2
+            old = (k in inst) ? inst[k] : ""
+            if (old == "" && ($1 "|noarch") in inst) old = inst[$1 "|noarch"]
+            s = (k in src) ? src[k] : (($1 in srcn) ? srcn[$1] : $1)
+            kind = (old == "") ? "new" : "up"
+            print kind "|" $1 "." $2 "|" s "|" old "|" $3 "|" ((k in sec) ? 1 : 0) "|" $4 "|" sev[k] "|" adv[k] "|" cve[k]
+        }
+        function rank(s) {
+            s = tolower(s)
+            if (s == "critical") return 4; if (s == "important") return 3
+            if (s == "moderate") return 2; if (s == "low") return 1; return 0
+        }' "$TMP/installed" "$TMP/adv" "$TMP/cve" "$TMP/avail" >"$TMP/upd"
+}
+
+# ---------------------------------------------------------------- zypper
+collect_zypper() {
+    _z="zypper --non-interactive --no-refresh"
+    # packages: <update kind="package" name=".." edition=".." arch=".." edition-old=".."> ... <source alias=".."/>
+    $NICE $_z --xmlout list-updates 2>>"$TMP/msgs" >"$TMP/lu.xml"
+    $NICE $_z --xmlout list-patches 2>>"$TMP/msgs" >"$TMP/lp.xml"
+    _attr() { sed -n "s/.* $1=\"\([^\"]*\)\".*/\1/p"; }
+    # one update element per record (elements may span several lines)
+    tr '\n' ' ' <"$TMP/lu.xml" | sed 's/<update /\n<update /g' | grep '^<update ' >"$TMP/lu.rec"
+    tr '\n' ' ' <"$TMP/lp.xml" | sed 's/<update /\n<update /g' | grep '^<update ' >"$TMP/lp.rec"
+    while IFS= read -r rec; do
+        _k=$(echo "$rec" | _attr kind)
+        [ "$_k" = "package" ] || continue
+        _n=$(echo "$rec" | _attr name)
+        _a=$(echo "$rec" | _attr arch)
+        _e=$(echo "$rec" | _attr edition)
+        _o=$(echo "$rec" | _attr edition-old)
+        _r=$(echo "$rec" | sed -n 's/.*<source [^>]*alias="\([^"]*\)".*/\1/p')
+        echo "$_n|$_a|$_o|$_e|$_r"
+    done <"$TMP/lu.rec" >"$TMP/zpk"
+    # needed patches: name|category|severity|cves|date
+    while IFS= read -r rec; do
+        _k=$(echo "$rec" | _attr kind)
+        [ "$_k" = "patch" ] || continue
+        _st=$(echo "$rec" | _attr status)
+        case "$_st" in needed | "") ;; *) continue ;; esac
+        _n=$(echo "$rec" | _attr name)
+        _c=$(echo "$rec" | _attr category)
+        _s=$(echo "$rec" | _attr severity)
+        _cv=$(echo "$rec" | grep -o 'type="cve" id="CVE-[0-9-]*"' | sed 's/.*id="//; s/"$//' | sort -u | tr '\n' ',' | sed 's/,$//')
+        _cv2=$(echo "$rec" | grep -o 'id="CVE-[0-9-]*" type="cve"' | sed 's/^id="//; s/".*//' | sort -u | tr '\n' ',' | sed 's/,$//')
+        [ -z "$_cv" ] && _cv=$_cv2
+        echo "$_n|$_c|$_s|$_cv"
+    done <"$TMP/lp.rec" >"$TMP/zpatch"
+    # packages contained in needed patches (Conflicts: pkg.arch < version)
+    : >"$TMP/zmap"
+    _names=$(cut -d'|' -f1 "$TMP/zpatch" | tr '\n' ' ')
+    if [ -n "$_names" ]; then
+        # shellcheck disable=SC2086
+        $NICE $_z info -t patch $_names 2>/dev/null | awk '
+            /^Name *: / { patch = $3; next }
+            /^Conflicts *: / {
+                rest = $0; sub(/^Conflicts *: */, "", rest)
+                if (rest !~ /^\[/ && rest ~ / (<|<=|=) /) { split(rest, f, " "); pa = f[1]; sub(/^srcpackage:/, "", pa); print pa "|" patch; next }
+                on = 1; next
+            }
+            on && /^[[:space:]]+[^[:space:]]+ *(<|<=|=) / { pa = $1; sub(/^srcpackage:/, "", pa); print pa "|" patch; next }
+            on && !/^[[:space:]]/ { on = 0 }' >"$TMP/zmap"
+    fi
+    awk -F'|' '
+        FILENAME == ARGV[1] { cat[$1] = $2; sev[$1] = $3; cves[$1] = $4; next }
+        FILENAME == ARGV[2] {
+            # pkg.arch or pkg -> patch
+            p = $2; m[$1] = (m[$1] == "" ? p : m[$1] "," p); next
+        }
+        {
+            n = $1; a = $2; key = n "." a
+            pl = (key in m) ? m[key] : ((n in m) ? m[n] : "")
+            issec = 0; best = ""; cv = ""; adv = ""
+            k = split(pl, pp, ",")
+            for (i = 1; i <= k; i++) {
+                p = pp[i]; if (!(p in cat)) continue
+                adv = (adv == "" ? p : adv "," p)
+                if (cat[p] == "security") issec = 1
+                if (rank(sev[p]) > rank(best)) best = sev[p]
+                if (cves[p] != "") cv = (cv == "" ? cves[p] : cv "," cves[p])
+            }
+            kind = ($3 == "") ? "new" : "up"
+            print kind "|" key "|" n "|" $3 "|" $4 "|" issec "|" $5 "|" tolower(best) "|" adv "|" cv
+        }
+        function rank(s) {
+            s = tolower(s)
+            if (s == "critical") return 4; if (s == "important") return 3
+            if (s == "moderate") return 2; if (s == "low") return 1; return 0
+        }' "$TMP/zpatch" "$TMP/zmap" "$TMP/zpk" >"$TMP/upd"
+    {
+        _np=$(grep -o 'kind="patch"' "$TMP/lp.xml" 2>/dev/null | wc -l)
+        _allp=$($_z patches 2>/dev/null | awk -F'|' 'NF >= 6 && $3 !~ /Category/' | grep -c . || true)
+        if [ "${_allp:-0}" -gt 0 ]; then echo "secinfo|1|$_allp patches (${_np:-0} needed)"; else echo "secinfo|0|no patch metadata"; fi
+        $_z locks 2>/dev/null | awk -F'|' 'NR > 2 && NF >= 2 { n = $2; gsub(/ /, "", n); if (n != "") print "hold|" n }'
+        $NICE $_z --xmlout packages --unneeded 2>/dev/null | sed -n 's/.*<solvable [^>]*name="\([^"]*\)".*/autoremove|\1/p' | sort -u
+        $NICE $_z --xmlout packages --orphaned 2>/dev/null | sed -n 's/.*<solvable [^>]*name="\([^"]*\)".*/orphan|\1/p' | sort -u
+        $_z --xmlout repos 2>/dev/null | tr '\n' ' ' | sed 's/<repo /\n<repo /g' | grep '^<repo ' |
+            grep 'enabled="1"' | sed -n 's/.* alias="\([^"]*\)".*/repo|-|\1||||| /p'
+        _v=$($NICE $_z verify --dry-run 2>/dev/null | grep -ciE 'problem|nothing provides' || true)
+        echo "audit|${_v:-0}|"
+        rpm_extras
+        zypper needs-rebooting >/dev/null 2>&1
+        [ $? -eq 102 ] && echo "reboot|tool|$(mtime /run/reboot-needed)|"
+        zypper ps -sss 2>/dev/null | awk 'NF == 1 && $1 ~ /^[A-Za-z0-9@._:-]+$/ {print "restart|" $1 ".service"}'
+    } >>"$TMP/extra"
+}
+
+case "$BACKEND" in
+    apt) collect_apt ;;
+    dnf) collect_dnf ;;
+    yum) collect_yum ;;
+    zypper) collect_zypper ;;
+esac
+
+# ----------------------------------------------------- kernel (all backends)
+_run=$(uname -r)
+case "$_run" in
+    *-[0-9]*-[a-z]*)
+        # Debian/Ubuntu/SUSE style: <ver>-<abi>-<flavor>
+        _flavor=$(echo "$_run" | sed -n 's/^[0-9][0-9.]*-[0-9][0-9.]*\(+[^-]*\)\{0,1\}-//p')
+        ;;
+    *) _flavor="" ;;
+esac
+if [ -n "$_flavor" ]; then
+    _cands=$(ls /boot/vmlinuz-*-"$_flavor" 2>/dev/null)
+else
+    _cands=$(ls /boot/vmlinuz-* 2>/dev/null | grep -v rescue)
+fi
+_newest=$(echo "$_cands" | sed 's|^/boot/vmlinuz-||' | grep . | sort -V | tail -n 1)
+if [ -n "$_newest" ] && [ "$_newest" != "$_run" ]; then
+    _top=$(printf '%s\n%s\n' "$_run" "$_newest" | sort -V | tail -n 1)
+    [ "$_top" = "$_newest" ] && echo "reboot|kernel|$(mtime "/boot/vmlinuz-$_newest")|$_run -> $_newest" >>"$TMP/extra"
+fi
+if [ "$CONTAINER" = "none" ] && [ ! -d "/lib/modules/$_run" ] && [ ! -d "/usr/lib/modules/$_run" ]; then
+    echo "reboot|modules|0|$_run" >>"$TMP/extra"
+fi
+
+# ------------------------------------------------- livepatch (all backends)
+# kernel livepatches currently loaded (Canonical Livepatch, kpatch, SUSE klp)
+_lp=""
+for _d in /sys/kernel/livepatch/*; do
+    [ -r "$_d/enabled" ] || continue
+    [ "$(cat "$_d/enabled" 2>/dev/null)" = "1" ] && _lp="$_lp ${_d##*/}"
+done
+_lplist=$(echo $_lp | tr ' ' ',')
+if have canonical-livepatch; then
+    _lpstate=$(canonical-livepatch status 2>/dev/null | sed -n 's/^ *patchState: *//p' | head -n 1)
+    echo "livepatch|canonical|${_lpstate:-unknown}|$_lplist" >>"$TMP/extra"
+elif [ -n "$_lp" ]; then
+    echo "livepatch|kernel|loaded|$_lplist" >>"$TMP/extra"
+fi
+
+# --------------------------------------------- snap / flatpak (cached, network)
+# "snap refresh --list" and "flatpak remote-ls --updates" ask the stores online,
+# so they only run with refresh=auto and the minimum interval; the result is
+# cached in $VARDIR/linux_updates.apps.
+APPS="$VARDIR/linux_updates.apps"
+if { have snap || have flatpak; } && [ "$REFRESH" = "auto" ]; then
+    _apps_ts=$(mtime "$APPS")
+    if [ $((NOW - _apps_ts)) -ge "$MIN_REFRESH" ]; then
+        _to2=""
+        have timeout && _to2="timeout 120"
+        {
+            if have snap; then
+                # shellcheck disable=SC2086
+                $_to2 snap refresh --list 2>/dev/null | awk 'NR > 1 && NF >= 3 {print "snap|" $1 "|" $2 "|" $3}'
+            fi
+            if have flatpak; then
+                # shellcheck disable=SC2086
+                $_to2 flatpak remote-ls --updates --columns=application,branch 2>/dev/null |
+                    awk 'NF >= 1 && $1 !~ /^Application/ {print "flatpak|" $1 "|" $2 "|"}'
+            fi
+        } >"$TMP/apps"
+        cp "$TMP/apps" "$APPS" 2>/dev/null
+    fi
+fi
+[ -r "$APPS" ] && cat "$APPS" >>"$TMP/extra"
+
+# ------------------------------------------------------------------ output
+echo "<<<linux_updates:sep(124)>>>"
+echo "meta|$PLUGIN_VERSION|$NOW"
+echo "os|$OS_ID|$OS_VER|$OS_CODE|$ARCH|$OS_LIKE"
+echo "backend|$BACKEND"
+echo "container|$CONTAINER"
+echo "cfg|$REFRESH|$MIN_REFRESH|$REFRESH_TIMEOUT"
+echo "cache|$CACHE_TS"
+echo "refresh|$LAST_ATTEMPT|$LAST_STATUS"
+
+# updates with first-seen: upd|kind|pkg|src|old|new|security|first_seen|origin|severity|advisory|cves
+touch "$SEEN" 2>/dev/null
+awk -F'|' -v now="$NOW" -v newseen="$TMP/seen.new" '
+    FILENAME == ARGV[1] { split($0, kv, " "); fs[kv[1]] = kv[2]; next }
+    NF >= 6 {
+        key = $2 "=" $5
+        t = (key in fs && fs[key] ~ /^[0-9]+$/) ? fs[key] : now
+        print key " " t > newseen
+        print "upd|" $1 "|" $2 "|" $3 "|" $4 "|" $5 "|" $6 "|" t "|" $7 "|" $8 "|" $9 "|" $10
+    }' "$SEEN" "$TMP/upd"
+if [ -f "$TMP/seen.new" ]; then
+    cp "$TMP/seen.new" "$SEEN" 2>/dev/null
+else
+    : >"$SEEN" 2>/dev/null
+fi
+
+cat "$TMP/extra"
+
+# warnings/errors: msg|level|text  (level W or E)
+grep -iE '^(W:|E:|Err:|Error|Warning|Failed|Problem|Curl error|Repository .* is invalid)' "$TMP/msgs" 2>/dev/null |
+    sed 's/|/\//g; s/[[:space:]]\{1,\}/ /g' | cut -c1-400 | sort -u |
+    awk '{
+        txt = $0; lvl = "E"
+        if (txt ~ /^(W:|[Ww]arning)/) lvl = "W"
+        sub(/^(W:|E:|Err:[0-9]*|[Ee]rror:?|[Ww]arning:?) */, "", txt)
+        print "msg|" lvl "|" txt
+    }' | sort -u
+
+# OS end of life from distro-info if present (the site has its own EOL data)
+_di=""
+case "$OS_ID" in
+    ubuntu) have ubuntu-distro-info && _di=ubuntu-distro-info ;;
+    debian) have debian-distro-info && _di=debian-distro-info ;;
+esac
+if [ -n "$_di" ] && [ -n "$OS_CODE" ]; then
+    _eol=$($_di --series="$OS_CODE" --days=eol 2>/dev/null)
+    case "${_eol#-}" in '' | *[!0-9]*) ;; *) echo "eol|host|$(date -d "@$((NOW + _eol * 86400))" +%Y-%m-%d 2>/dev/null)" ;; esac
+fi
+exit 0
