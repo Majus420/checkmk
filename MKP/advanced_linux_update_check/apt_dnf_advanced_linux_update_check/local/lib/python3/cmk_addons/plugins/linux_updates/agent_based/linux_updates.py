@@ -652,6 +652,12 @@ def check_linux_updates_repos(item: str, params: Mapping[str, Any], section: Sec
                 state=_state(params.get("refresh_warnings_state", 0)),
                 summary="last refresh with warnings",
             )
+        elif section.refresh_status == "noroot":
+            yield Result(
+                state=State.OK,
+                notice="Agent does not run as root: metadata refresh skipped "
+                "(relies on the system's own update timer)",
+            )
     errors = [t for lvl, t in section.messages if lvl == "E"]
     warnings = [t for lvl, t in section.messages if lvl == "W"]
     dupes = [t for t in warnings if "configured multiple times" in t or "listed more than once" in t]

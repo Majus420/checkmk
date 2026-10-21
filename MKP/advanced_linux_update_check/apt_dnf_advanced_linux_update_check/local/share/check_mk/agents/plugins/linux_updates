@@ -55,10 +55,6 @@ export LC_ALL LANG
 CONFDIR="${MK_CONFDIR:-/etc/check_mk}"
 VARDIR="${MK_VARDIR:-/var/lib/check_mk_agent}"
 CFG="$CONFDIR/linux_updates.cfg"
-SEEN="$VARDIR/linux_updates.seen"
-REFRESH_STATE="$VARDIR/linux_updates.refresh"
-REFRESH_LOG="$VARDIR/linux_updates.refresh.log"
-REFRESH_OK="$VARDIR/linux_updates.refresh_ok"
 
 have() { command -v "$1" >/dev/null 2>&1; }
 
@@ -113,7 +109,27 @@ is_int "$MIN_REFRESH" || MIN_REFRESH=14400
 is_int "$REFRESH_TIMEOUT" || REFRESH_TIMEOUT=300
 [ "$REFRESH_TIMEOUT" -lt 30 ] && REFRESH_TIMEOUT=30
 
+# State directory: $VARDIR, or - if the agent cannot write there (non-root
+# agent, read-only or foreign MK_VARDIR) - /var/tmp/linux_updates.<uid>.
+# Without any writable state the plug-in still reports, but first-seen times
+# start anew on every run (reported as a warning).
+UID_NOW=$(id -u 2>/dev/null)
+is_int "$UID_NOW" || UID_NOW=0
+STATE_WARN=""
 mkdir -p "$VARDIR" 2>/dev/null
+STATEDIR=""
+for _d in "$VARDIR" "/var/tmp/linux_updates.$UID_NOW"; do
+    mkdir -p "$_d" 2>/dev/null
+    if [ -d "$_d" ] && [ -w "$_d" ]; then
+        STATEDIR=$_d
+        break
+    fi
+done
+SEEN="$STATEDIR/linux_updates.seen"
+REFRESH_STATE="$STATEDIR/linux_updates.refresh"
+REFRESH_LOG="$STATEDIR/linux_updates.refresh.log"
+REFRESH_OK="$STATEDIR/linux_updates.refresh_ok"
+APPS="$STATEDIR/linux_updates.apps"
 # Temporary directory. The agent may export a TMPDIR that does not exist
 # (Agent Bakery setting, e.g. /var/lib/check_mk_agent/tmp) - mktemp would then
 # fail silently. Create it if needed, fall back to $VARDIR and /tmp, and report
@@ -134,7 +150,17 @@ if [ -z "$TMP" ]; then
     echo "msg|E|agent plug-in linux_updates: cannot create a temporary directory (TMPDIR=${TMPDIR:-unset})"
     exit 0
 fi
-trap 'rm -rf "$TMP"' EXIT INT TERM
+trap 'rm -rf "$TMP"' EXIT
+trap 'exit 1' INT TERM HUP
+if [ -z "$STATEDIR" ]; then
+    STATEDIR=$TMP
+    SEEN="$STATEDIR/linux_updates.seen"
+    REFRESH_STATE="$STATEDIR/linux_updates.refresh"
+    REFRESH_LOG="$STATEDIR/linux_updates.refresh.log"
+    REFRESH_OK="$STATEDIR/linux_updates.refresh_ok"
+    APPS="$STATEDIR/linux_updates.apps"
+    STATE_WARN="agent plug-in linux_updates: no writable state directory ($VARDIR, /var/tmp) - first-seen times are not kept"
+fi
 
 NOW=$(date +%s)
 NICE=""
@@ -199,7 +225,10 @@ if [ -r "$REFRESH_STATE" ]; then
 fi
 CACHE_TS=$(cache_ts)
 
-if [ "$REFRESH" = "auto" ]; then
+if [ "$REFRESH" = "auto" ] && [ "$UID_NOW" -ne 0 ]; then
+    # a non-root agent cannot refresh package metadata - do not try every run
+    LAST_STATUS="noroot"
+elif [ "$REFRESH" = "auto" ]; then
     if [ $((NOW - LAST_ATTEMPT)) -ge "$MIN_REFRESH" ] && [ $((NOW - CACHE_TS)) -ge "$MIN_REFRESH" ]; then
         run_refresh >"$TMP/refresh.log" 2>&1
         _rc=$?
@@ -216,7 +245,7 @@ if [ "$REFRESH" = "auto" ]; then
         fi
         if [ "$LAST_STATUS" != "locked" ]; then
             LAST_ATTEMPT=$NOW
-            echo "$LAST_ATTEMPT $LAST_STATUS" >"$REFRESH_STATE"
+            echo "$LAST_ATTEMPT $LAST_STATUS" >"$REFRESH_STATE" 2>/dev/null
             cp "$TMP/refresh.log" "$REFRESH_LOG" 2>/dev/null
             case "$LAST_STATUS" in ok | warnings) touch "$REFRESH_OK" ;; esac
         fi
@@ -667,8 +696,7 @@ fi
 # "snap refresh --list" and "flatpak remote-ls --updates" ask the stores online,
 # so they only run with refresh=auto and the minimum interval; the result is
 # cached in $VARDIR/linux_updates.apps.
-APPS="$VARDIR/linux_updates.apps"
-if { have snap || have flatpak; } && [ "$REFRESH" = "auto" ]; then
+if { have snap || have flatpak; } && [ "$REFRESH" = "auto" ] && [ "$UID_NOW" -eq 0 ]; then
     _apps_ts=$(mtime "$APPS")
     if [ $((NOW - _apps_ts)) -ge "$MIN_REFRESH" ]; then
         _to2=""
@@ -687,7 +715,7 @@ if { have snap || have flatpak; } && [ "$REFRESH" = "auto" ]; then
         cp "$TMP/apps" "$APPS" 2>/dev/null
     fi
 fi
-[ -r "$APPS" ] && cat "$APPS" >>"$TMP/extra"
+[ -r "$APPS" ] && tr -cd '\11\12\40-\176' <"$APPS" | grep -E '^(snap|flatpak)\|' >>"$TMP/extra"
 
 # ------------------------------------------------------------------ output
 echo "<<<linux_updates:sep(124)>>>"
@@ -700,7 +728,8 @@ echo "cache|$CACHE_TS"
 echo "refresh|$LAST_ATTEMPT|$LAST_STATUS"
 
 # updates with first-seen: upd|kind|pkg|src|old|new|security|first_seen|origin|severity|advisory|cves
-touch "$SEEN" 2>/dev/null
+_seen_in=/dev/null
+[ -r "$SEEN" ] && [ -f "$SEEN" ] && _seen_in=$SEEN
 awk -F'|' -v now="$NOW" -v newseen="$TMP/seen.new" '
     FILENAME == ARGV[1] { split($0, kv, " "); fs[kv[1]] = kv[2]; next }
     NF >= 6 {
@@ -708,14 +737,15 @@ awk -F'|' -v now="$NOW" -v newseen="$TMP/seen.new" '
         t = (key in fs && fs[key] ~ /^[0-9]+$/) ? fs[key] : now
         print key " " t > newseen
         print "upd|" $1 "|" $2 "|" $3 "|" $4 "|" $5 "|" $6 "|" t "|" $7 "|" $8 "|" $9 "|" $10
-    }' "$SEEN" "$TMP/upd"
+    }' "$_seen_in" "$TMP/upd"
 if [ -f "$TMP/seen.new" ]; then
     cp "$TMP/seen.new" "$SEEN" 2>/dev/null
 else
-    : >"$SEEN" 2>/dev/null
+    cp /dev/null "$SEEN" 2>/dev/null
 fi
 
 cat "$TMP/extra"
+[ -n "$STATE_WARN" ] && echo "msg|W|$STATE_WARN"
 
 # warnings/errors: msg|level|text  (level W or E)
 grep -iE '^(W:|E:|Err:|Error|Warning|Failed|Problem|Curl error|Repository .* is invalid)' "$TMP/msgs" 2>/dev/null |
