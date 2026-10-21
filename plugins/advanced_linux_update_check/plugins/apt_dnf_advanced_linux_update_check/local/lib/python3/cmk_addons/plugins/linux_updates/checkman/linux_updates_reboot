@@ -1,0 +1,15 @@
+title: Linux: Reboot required
+agents: linux
+catalog: os/misc
+license: GPLv2
+distribution: check_mk
+description:
+ Reports a required reboot: reboot-required flag (Debian/Ubuntu), dnf/yum
+ needs-restarting, zypper needs-rebooting, a newer installed kernel than the
+ running one, or missing modules of the running kernel. Optionally escalates
+ after a configurable time. Services needing a restart are listed
+ (needrestart, needs-restarting -s, zypper ps). Inside containers the service
+ is not applicable and stays OK.
+
+discovery:
+ One service is created on each host that sends the linux_updates section.
