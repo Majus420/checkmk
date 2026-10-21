@@ -5,7 +5,7 @@ linux_updates - check plug-ins for package updates on Linux
 
 Author:   Marius Gielnik
 Project:  https://github.com/Majus420/checkmk/tree/main/MKP/advanced_linux_update_check
-Version:  1.3.0
+Version:  1.3.1
 License:  GPL-2.0-or-later
 
 Section:  linux_updates (agent plug-in "linux_updates", deployed by the bakery

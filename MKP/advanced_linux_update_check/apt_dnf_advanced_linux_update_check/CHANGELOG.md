@@ -1,5 +1,9 @@
 # Changelog
 
+## 1.3.1 – 2026-10-21
+
+- Fix: agent plug-in produced no output when the agent exports a TMPDIR that does not exist (Agent Bakery setting, e.g. /var/lib/check_mk_agent/tmp). The plug-in now creates it, falls back to the agent state directory or /tmp, and reports an error line in Repository Health instead of staying silent
+
 ## 1.3.0 – 2026-10-21
 
 - HW/SW inventory: pending updates and CVE table (searchable by CVE / package)

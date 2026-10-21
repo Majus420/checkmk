@@ -9,7 +9,7 @@ for unattended nightly patching).
 - Author: Marius Gielnik
 - License: GPL-2.0-or-later
 - Checkmk: 2.5.0 or newer (commercial editions for the Agent Bakery rule)
-- Package: `apt_dnf_advanced_linux_update_check-1.3.0.mkp` (see [`dist/`](dist/))
+- Package: `apt_dnf_advanced_linux_update_check-1.3.1.mkp` (see [`dist/`](dist/))
 
 ## Why
 
@@ -167,6 +167,8 @@ Tested before release:
 Not yet verified on real hosts: dnf5 (Fedora 41+, RHEL 10), yum (EL7).
 
 ## Known limitations
+
+- If the agent exports a TMPDIR that does not exist, the plug-in creates it (or falls back to the agent state directory / /tmp).
 
 - Age counts from first sight on the host, not from publication (apt provides no dates).
 - apt: severity only where OSV provides it; KEV and EPSS apply regardless.

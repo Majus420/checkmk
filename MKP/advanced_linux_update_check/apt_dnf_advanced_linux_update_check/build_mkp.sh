@@ -17,7 +17,7 @@
 set -euo pipefail
 
 NAME="apt_dnf_advanced_linux_update_check"
-VERSION="1.3.0"
+VERSION="1.3.1"
 HERE="$(cd "$(dirname "$0")" && pwd)"
 
 [ -n "${OMD_ROOT:-}" ] || { echo "run as site user"; exit 1; }
