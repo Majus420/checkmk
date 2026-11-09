@@ -1,0 +1,38 @@
+title: Windows: SMB share performance (latency, queue length)
+agents: windows
+catalog: os/storage
+license: GPLv2
+distribution: check_mk
+description:
+ Monitors the performance of SMB shares on a Windows file server, based on the
+ performance object "SMB Server Shares": average latency per data, read, write
+ and any request, average data/read/write queue length, current data queue
+ length, pending requests, data/read/write/metadata requests per second,
+ throughput, open files and connections. An interval without any request is
+ shown as "no requests" instead of a latency of 0.
+
+ The agent plug-in win_smb_shares.ps1 reads the raw counters through the .NET
+ performance counter classes (same data as perfmon), with the English counter
+ names that .NET also resolves on localized Windows. WMI is only a fallback;
+ the source in use is shown in the service details. Rates are computed on the Checkmk server from two
+ consecutive agent outputs according to the counter type Windows reports. The
+ first check after discovery shows "Initializing counters".
+
+ Default levels: data/read/write latency 20/50 ms, average and current data
+ queue length 2/5 (20 ms and a queue of 2 are Microsoft's rules of thumb for the
+ matching disk counters). The rule "Windows SMB share performance" changes them
+ per share; "No levels" switches a default off.
+
+ Requires Windows Server 2012 or newer and the agent plug-in, deployed with the
+ Agent Bakery rule "Windows: SMB share performance (agent plug-in)".
+
+item:
+ The share name as reported by Windows, without the leading \\*\.
+
+discovery:
+ One service per share. The administrative shares Windows creates itself
+ (drive shares like C$, ADMIN$, IPC$, print$) and _Total are excluded by
+ default; hidden user shares such as home$ are discovered. The rule
+ "Windows SMB share discovery" selects shares by name (regular expression) or
+ by local path as plain text (E:\home, D:\Shares\Public, E:\* for everything
+ below a folder). The local path is shown in the service details.
