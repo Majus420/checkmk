@@ -21,7 +21,7 @@ import tarfile
 import time
 
 NAME = "windows_smb_share_performance"
-VERSION = "1.4.0"
+VERSION = "1.4.1"
 HERE = pathlib.Path(__file__).resolve().parent
 LOCAL = HERE / "local"
 

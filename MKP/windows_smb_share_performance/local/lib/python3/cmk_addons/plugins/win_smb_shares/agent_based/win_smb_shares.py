@@ -202,9 +202,10 @@ def discover_win_smb_shares(params: Mapping[str, Any], section: SmbSection) -> D
     exclude = params.get("exclude", DISCOVERY_DEFAULT["exclude"])
     paths = params.get("paths")
     for name in sorted(section.shares):
-        if include and not _matches(include, name):
+        # Windows share names are case insensitive
+        if include and not _matches(include, name, re.IGNORECASE):
             continue
-        if _matches(exclude, name):
+        if _matches(exclude, name, re.IGNORECASE):
             continue
         if paths and not path_selected(section.paths.get(name, ""), paths):
             continue

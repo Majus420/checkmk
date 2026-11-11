@@ -5,7 +5,7 @@
 #
 # Author:   Marius Gielnik
 # Project:  https://github.com/Majus420/checkmk/tree/main/MKP/advanced_linux_update_check
-# Version:  1.3.1
+# Version:  1.3.3
 # License:  GPL-2.0-or-later
 #
 # Purpose:  Collects everything the "linux_updates" check plug-ins need:
@@ -46,7 +46,7 @@
 #           $MK_VARDIR/linux_updates.* may be deleted.
 # -----------------------------------------------------------------------------
 
-PLUGIN_VERSION="1.3.1"
+PLUGIN_VERSION="1.3.3"
 
 LC_ALL=C
 LANG=C
@@ -207,6 +207,17 @@ cache_ts() {
     esac
 }
 
+success_ts() {
+    # newest SUCCESSFUL metadata refresh, from markers that are only written on
+    # success (unlike lists/partial or repomd.xml, which a failed run touches too):
+    #   own refresh ok/warnings ($REFRESH_OK), apt.systemd.daily (update-stamp),
+    #   APT::Update::Post-Invoke-Success hook (update-success-stamp)
+    case "$BACKEND" in
+        apt) mtime "$REFRESH_OK" /var/lib/apt/periodic/update-success-stamp /var/lib/apt/periodic/update-stamp ;;
+        *) mtime "$REFRESH_OK" ;;
+    esac
+}
+
 run_refresh() {
     # shellcheck disable=SC2086
     case "$BACKEND" in
@@ -262,7 +273,10 @@ fi
 : >"$TMP/upd"
 : >"$TMP/extra"
 : >"$TMP/msgs"
-[ -r "$REFRESH_LOG" ] && cat "$REFRESH_LOG" >>"$TMP/msgs"
+# output of the last own refresh: kept separate, its errors are rated by the
+# check together with the refresh status (grace period), not as standing errors
+: >"$TMP/rmsgs"
+[ -r "$REFRESH_LOG" ] && cat "$REFRESH_LOG" >>"$TMP/rmsgs"
 
 # ---------------------------------------------------------------- apt
 collect_apt() {
@@ -343,7 +357,7 @@ collect_apt() {
         [ -s /etc/apt/trusted.gpg ] && echo "legacykey|1"
         _a=$(dpkg --audit 2>/dev/null | grep -c '^ ')
         _ap=$(dpkg --audit 2>/dev/null | grep '^ ' | head -n 3 | awk '{print $1}' | tr '\n' ' ' | sed 's/ $//')
-        apt-get check -q >/dev/null 2>&1 || _a=$((_a + 1))
+        apt-get check -q -o Debug::NoLocking=1 >/dev/null 2>&1 || _a=$((_a + 1))
         echo "audit|$_a|$_ap"
         _inst_uu=0
         dpkg-query -W -f='${Status}' unattended-upgrades 2>/dev/null | grep -q 'install ok installed' && _inst_uu=1
@@ -724,7 +738,7 @@ echo "os|$OS_ID|$OS_VER|$OS_CODE|$ARCH|$OS_LIKE"
 echo "backend|$BACKEND"
 echo "container|$CONTAINER"
 echo "cfg|$REFRESH|$MIN_REFRESH|$REFRESH_TIMEOUT"
-echo "cache|$CACHE_TS"
+echo "cache|$CACHE_TS|$(success_ts)"
 echo "refresh|$LAST_ATTEMPT|$LAST_STATUS"
 
 # updates with first-seen: upd|kind|pkg|src|old|new|security|first_seen|origin|severity|advisory|cves
@@ -747,15 +761,19 @@ fi
 cat "$TMP/extra"
 [ -n "$STATE_WARN" ] && echo "msg|W|$STATE_WARN"
 
-# warnings/errors: msg|level|text  (level W or E)
-grep -iE '^(W:|E:|Err:|Error|Warning|Failed|Problem|Curl error|Repository .* is invalid)' "$TMP/msgs" 2>/dev/null |
-    sed 's/|/\//g; s/[[:space:]]\{1,\}/ /g' | cut -c1-400 | sort -u |
-    awk '{
-        txt = $0; lvl = "E"
-        if (txt ~ /^(W:|[Ww]arning)/) lvl = "W"
-        sub(/^(W:|E:|Err:[0-9]*|[Ee]rror:?|[Ww]arning:?) */, "", txt)
-        print "msg|" lvl "|" txt
-    }' | sort -u
+# warnings/errors: msg|level|text  (level W or E; R = error of the last own refresh)
+emit_msgs() {
+    grep -iE '^(W:|E:|Err:|Error|Warning|Failed|Problem|Curl error|Repository .* is invalid)' "$1" 2>/dev/null |
+        sed 's/|/\//g; s/[[:space:]]\{1,\}/ /g' | cut -c1-400 | sort -u |
+        awk -v elvl="$2" '{
+            txt = $0; lvl = elvl
+            if (txt ~ /^(W:|[Ww]arning)/) lvl = "W"
+            sub(/^(W:|E:|Err:[0-9]*|[Ee]rror:?|[Ww]arning:?) */, "", txt)
+            print "msg|" lvl "|" txt
+        }' | sort -u
+}
+emit_msgs "$TMP/msgs" E
+emit_msgs "$TMP/rmsgs" R
 
 # OS end of life from distro-info if present (the site has its own EOL data)
 _di=""

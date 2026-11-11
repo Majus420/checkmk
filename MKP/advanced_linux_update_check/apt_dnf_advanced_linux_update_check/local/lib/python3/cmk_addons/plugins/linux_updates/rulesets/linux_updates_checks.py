@@ -324,6 +324,21 @@ def _form_repos() -> Dictionary:
                 required=True,
                 parameter_form=_state("State if the last metadata refresh failed", 1),
             ),
+            "refresh_failed_grace": DictElement(
+                required=False,
+                parameter_form=TimeSpan(
+                    title=Title("Report a failed refresh only if there was no successful refresh for"),
+                    help_text=Help(
+                        "A single failed or timed-out refresh (e.g. a slow mirror) is shown as "
+                        "notice only, as long as a refresh succeeded within this time. Success "
+                        "is taken from the plug-in's own refresh and the system's update timer "
+                        "(apt update-stamp / update-success-stamp). 0 = report every failure."
+                    ),
+                    displayed_magnitudes=_MAG_DAYS,
+                    prefill=DefaultValue(86400.0),
+                    custom_validate=(NumberInRange(min_value=0),),
+                ),
+            ),
             "refresh_warnings_state": DictElement(
                 required=True,
                 parameter_form=_state("State if the last metadata refresh had warnings", 0),

@@ -1,5 +1,9 @@
 # Changelog - windows_smb_share_performance
 
+## 1.4.1 - 2026-11-10
+- Share name filters (default exclusions and the discovery rule's regular expressions) are
+  case insensitive, like share names on Windows (ADMIN$ = admin$, home$ = HOME$).
+
 ## 1.4.0 - 2026-11-09
 - New values per share: data/read/write/metadata requests per second, throughput
   (data/read/write bytes per second), open files, connections (tree connects).

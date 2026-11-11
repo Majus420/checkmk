@@ -9,7 +9,7 @@ for unattended nightly patching).
 - Author: Marius Gielnik
 - License: GPL-2.0-or-later
 - Checkmk: 2.5.0 or newer (commercial editions for the Agent Bakery rule)
-- Package: `apt_dnf_advanced_linux_update_check-1.3.1.mkp` (see [`dist/`](dist/))
+- Package: `apt_dnf_advanced_linux_update_check-1.3.3.mkp` (see [`dist/`](dist/))
 
 ## Why
 
@@ -118,6 +118,17 @@ the only step that contacts the mirrors. It runs only when both the plug-in's la
 and the last refresh by anybody (e.g. `apt-daily.timer`) are older than the minimum interval,
 so a failing mirror is never hammered.
 
+A failed or timed-out refresh (and the errors it printed) is rated together with the last
+successful refresh: it is only reported if no refresh succeeded within the grace period of the
+rule "APT/DNF/Zypper: repository health" (default 24 h, 0 = report every failure). Success is
+taken from the plug-in's own refresh and from markers that are only written on success
+(apt `update-stamp`, `update-success-stamp`). A single slow mirror stays a notice, a refresh
+that keeps failing becomes WARN.
+
+`apt-get check` runs without taking the dpkg lock, so a package operation running at the same
+time (unattended-upgrades, Ansible) or a non-root agent does not show up as a package database
+problem.
+
 Host-side state: `/var/lib/check_mk_agent/linux_updates.seen` (first-seen times),
 `linux_updates.refresh` and `linux_updates.refresh.log` (last refresh).
 
@@ -163,6 +174,11 @@ Tested before release:
 - dpkg version comparison against `dpkg --compare-versions`: 1941 comparisons, 0 differences
 - all three checks on all three package managers, switching off tiers, escalation, end of life
 - rule sets against the Checkmk 2.5.0 plug-in APIs; MKP built with cmk-mkp-tool 3.0.0
+
+1.3.3 additionally verified in production (Checkmk 2.5, three sites, about 1,000 update
+services, no crash/UNKNOWN): plug-ins load, new rule parameter in the GUI, dry run with real
+agent data of 1.3.2 agents; agent plug-in on a real apt host (real refresh, dash and bash,
+non-root, dpkg lock held by another process) and on Oracle Linux with dnf (real refresh).
 
 Not yet verified on real hosts: dnf5 (Fedora 41+, RHEL 10), yum (EL7).
 

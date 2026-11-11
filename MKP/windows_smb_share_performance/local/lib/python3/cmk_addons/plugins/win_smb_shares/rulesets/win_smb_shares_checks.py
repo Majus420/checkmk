@@ -167,14 +167,14 @@ def _discovery_form() -> Dictionary:
             "include": DictElement(
                 parameter_form=_regex_list(
                     "Only discover shares matching",
-                    "Regular expressions (infix match). If set, only matching shares are discovered.",
+                    "Regular expressions (infix match, case insensitive). If set, only matching shares are discovered.",
                 )
             ),
             "exclude": DictElement(
                 parameter_form=List(
                     title=Title("Do not discover shares matching"),
                     help_text=Help(
-                        "Regular expressions (infix match). If this option is not set, the administrative "
+                        "Regular expressions (infix match, case insensitive). If this option is not set, the administrative "
                         "shares (^[A-Za-z]\\$$, ^(ADMIN|IPC|print)\\$$) and ^_Total$ are excluded. If set, "
                         "only these patterns apply."
                     ),

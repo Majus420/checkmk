@@ -5,7 +5,7 @@ linux_updates - check plug-ins for package updates on Linux
 
 Author:   Marius Gielnik
 Project:  https://github.com/Majus420/checkmk/tree/main/MKP/advanced_linux_update_check
-Version:  1.3.1
+Version:  1.3.3
 License:  GPL-2.0-or-later
 
 Section:  linux_updates (agent plug-in "linux_updates", deployed by the bakery
@@ -120,6 +120,7 @@ class Section:
     container: str = "none"
     refresh_mode: str = "never"
     cache_ts: float = 0.0
+    success_ts: float = 0.0
     refresh_ts: float = 0.0
     refresh_status: str = "never"
     updates: list[Update] = field(default_factory=list)
@@ -186,6 +187,7 @@ def parse_linux_updates(string_table: StringTable) -> Section | None:
             s.refresh_mode = rest[0]
         elif key == "cache":
             s.cache_ts = _f(rest[0])
+            s.success_ts = _f(rest[1]) if len(rest) > 1 else 0.0
         elif key == "refresh":
             s.refresh_ts, s.refresh_status = _f(rest[0]), rest[1]
         elif key == "upd":
@@ -595,6 +597,7 @@ check_plugin_linux_updates_reboot = CheckPlugin(
 DEFAULT_REPOS: dict[str, Any] = {
     "cache_age": ("fixed", (259200.0, 604800.0)),
     "refresh_failed_state": 1,
+    "refresh_failed_grace": 86400.0,
     "refresh_warnings_state": 0,
     "errors_state": 1,
     "no_security_info_state": 1,
@@ -640,13 +643,36 @@ def check_linux_updates_repos(item: str, params: Mapping[str, Any], section: Sec
             state=_state(params.get("refresh_failed_state", 1)),
             summary="Package metadata refresh time unknown",
         )
+    refresh_errors = [t for lvl, t in section.messages if lvl == "R"]
     if section.refresh_mode == "auto":
         if section.refresh_status in ("failed", "timeout"):
-            yield Result(
-                state=_state(params.get("refresh_failed_state", 1)),
-                summary=f"last refresh {section.refresh_status} "
-                f"({render.timespan(_age(now, section.refresh_ts))} ago)",
+            text = (
+                f"last refresh {section.refresh_status} "
+                f"({render.timespan(_age(now, section.refresh_ts))} ago)"
             )
+            grace = float(params.get("refresh_failed_grace", 86400.0))
+            success_age = _age(now, section.success_ts) if section.success_ts > 0 else None
+            if section.success_ts > section.refresh_ts > 0 or (
+                success_age is not None and success_age < grace
+            ):
+                # superseded by a later success, or a single failure while the last
+                # success is recent enough (slow mirror, one-off timeout)
+                yield Result(
+                    state=State.OK,
+                    notice=f"{text}, last successful refresh "
+                    f"{render.timespan(success_age or 0.0)} ago",
+                )
+                for t in refresh_errors:
+                    yield Result(state=State.OK, notice=f"refresh error: {t}")
+            else:
+                if refresh_errors:
+                    text += f": {refresh_errors[0][:120]}"
+                yield Result(
+                    state=_state(params.get("refresh_failed_state", 1)),
+                    summary=text,
+                )
+                for t in refresh_errors[1:]:
+                    yield Result(state=State.OK, notice=f"refresh error: {t}")
         elif section.refresh_status == "warnings":
             yield Result(
                 state=_state(params.get("refresh_warnings_state", 0)),

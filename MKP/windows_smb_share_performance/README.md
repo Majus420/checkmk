@@ -58,13 +58,16 @@ and "SMB share open files and connections", perfometer on data latency.
    Without the Bakery: copy `win_smb_shares.ps1` to `C:\ProgramData\checkmk\agent\plugins\`.
 3. Run the service discovery on the file server.
 
+Only the agent rule is required. Without further rules all shares except the administrative ones
+are discovered and the default levels apply.
+
 ## Rules
 
-| Rule | Where | Purpose |
-|---|---|---|
-| Windows: SMB share performance (agent plug-in) | Agent rules | deploy plug-in, synchronous / asynchronous / do not deploy, timeout |
-| Windows SMB share discovery | Discovery rules | include / exclude shares by regular expression |
-| Windows SMB share performance | Service monitoring rules (Storage) | upper levels per value, per share (item) |
+| Rule | Where | Required | Purpose |
+|---|---|---|---|
+| Windows: SMB share performance (agent plug-in) | Agent rules | **yes** | deploy plug-in, synchronous / asynchronous / do not deploy, timeout |
+| Windows SMB share discovery | Discovery rules | no | only some shares: by local path (plain text) or by name (regex) |
+| Windows SMB share performance | Service monitoring rules (Storage) | no | change or switch off the default levels, levels for open files / connections, per share |
 
 **Select shares by local path (easiest):** in the discovery rule enter the folders as plain
 text, e.g. `E:\home`, `D:\Shares\Public`, or `E:\*` for all shares below a folder. No need to know
@@ -73,7 +76,8 @@ path is also shown in the details of every service.
 
 **Discovery default:** all shares except the administrative shares Windows creates itself
 (`^[A-Za-z]\$$`, `^(ADMIN|IPC|print)\$$`) and `^_Total$`. Hidden user shares such as `home$`
-are discovered. The share name is used without the leading `\\*\`.
+are discovered. The share name is used without the leading `\\*\`. Name filters are case
+insensitive, like share names on Windows.
 
 **Levels default (no rule needed):**
 

@@ -1,5 +1,16 @@
 # Changelog
 
+## 1.3.3 – 2026-11-11
+
+- Fix: "package database problems" was reported while another package operation was running (unattended-upgrades, Ansible, manual apt) and always on agents running as non-root. `apt-get check` needs the dpkg lock and failed on it; it now runs without locking (`Debug::NoLocking`), like the simulated upgrade. Real dependency problems are still detected
+- Repository Health: a failed or timed-out metadata refresh is only reported if there was no successful refresh within a grace period (new parameter, default 24 h, 0 = report every failure). A single slow refresh no longer causes a warning; a refresh that keeps failing still does
+- Errors from the plug-in's own metadata refresh (e.g. a mirror that could not be reached once) follow the same grace period and are shown with the refresh status, instead of a separate immediate "package manager errors" warning. Errors that keep coming back are still reported. Warnings of the refresh (duplicate sources, legacy keyring) are unchanged
+- Tested against: dpkg lock held by another process, non-root agent, real unmet dependency (still reported), failure with recent / old / no successful refresh, refresh errors within and after the grace period, old agent output, dash and bash
+
+## 1.3.2 – 2026-11-10
+
+- Fix: Repository Health stayed WARN with "last refresh failed/timeout" although the package metadata were refreshed successfully afterwards (e.g. by apt-daily.timer). A failed or timed-out refresh of the plug-in is now only reported until a successful refresh follows. Success is taken only from markers written on success (own refresh, apt `update-stamp`, `update-success-stamp`), not from `lists/partial`, which a failed run touches too. Older agent plug-ins keep the previous behaviour
+
 ## 1.3.1 – 2026-10-21
 
 - Fix: agent plug-in produced no output when the agent exports a TMPDIR that does not exist (Agent Bakery setting, e.g. /var/lib/check_mk_agent/tmp). The plug-in now creates it, falls back to the agent state directory or /tmp, and reports an error line in Repository Health instead of staying silent
