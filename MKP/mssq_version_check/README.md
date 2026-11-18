@@ -3,6 +3,14 @@
 CheckMK 2.4 Plugin — monitors installed MSSQL version per instance and checks for available CU/GDR updates via Microsoft Learn.
 
 ## Changelog
+- **1.0.28**: **Fix for `No entry for SQL Server <year> in cache` (UNKNOWN).** A year whose fetch
+  failed once was dropped from the cache and not retried for 24h (the cache was also written
+  non-atomically by many parallel checks). Now: the cache is per year (missing / old-format / >24h
+  years are refreshed individually), previous values are kept when a refresh fails (stale data +
+  WARN notice instead of UNKNOWN), failed fetches are retried at most every 30 min, a lock file
+  ensures only one process refreshes, and the cache file is written atomically. Table parsing of
+  the Microsoft build pages is more tolerant (attributes/whitespace) and redirects
+  (Learn -> support.microsoft.com) are followed.
 - **1.0.27**: **Important fix.** Removed the plugin's own `AgentSection(name="mssql_instance", ...)`
   registration. It collided with CheckMK's built-in section of the same name
   (`cmk.plugins.mssql.agent_based.mssql_instance`), which silently broke the official
@@ -31,8 +39,8 @@ CheckMK 2.4 Plugin — monitors installed MSSQL version per instance and checks 
 
 ## Installation
 ```bash
-mkp add mssql_version_check-1_0_27.mkp
-mkp enable mssql_version_check 1.0.27
+mkp add mssql_version_check-1_0_28.mkp
+mkp enable mssql_version_check 1.0.28
 cmk -II <hostname>
 ```
 
