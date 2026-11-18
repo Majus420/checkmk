@@ -38,6 +38,7 @@
 
 from __future__ import annotations
 
+import html
 import json
 import os
 import re
@@ -89,16 +90,19 @@ _MSLEARN_URL = (
 
 _CACHE_FILENAME        = "var/check_mk/mssql_latest_builds.json"
 _CACHE_MAX_AGE_SECONDS = 24 * 60 * 60
-_HTTP_TIMEOUT          = 20
+_HTTP_TIMEOUT          = 15
 
-# CU-only rows: <td>CU25</td> or <td>CU25 (Latest)</td> — excludes GDR rows
-_CU_BUILD_RE = re.compile(
-    r"<td>CU\d+(?:\s*\([^)]*\))?</td>\s*<td>(1[2-7]\.0\.\d+\.\d+)</td>",
-    re.IGNORECASE,
-)
+# Cache behaviour
+_CACHE_SCHEMA          = 2
+_RETRY_FAILED_SECONDS  = 30 * 60      # do not hammer Microsoft after a failed fetch
+_LOCK_STALE_SECONDS    = 180
+_FETCH_BUDGET_SECONDS  = 60           # max total time one refresh may take
 
-# All builds (CU + GDR) — highest available
-_ALL_BUILD_RE = re.compile(r"<td>(1[2-7]\.0\.(\d{3,})\.\d+)</td>")
+_BUILD_RE  = re.compile(r"\b(1[2-7]\.0\.\d{3,}\.\d+)\b")
+_CU_NAME_RE = re.compile(r"^CU\s*\d+(?:\s*\([^)]*\))?$", re.IGNORECASE)
+_ROW_RE    = re.compile(r"<tr\b[^>]*>(.*?)</tr>", re.IGNORECASE | re.DOTALL)
+_CELL_RE   = re.compile(r"<t[dh]\b[^>]*>(.*?)</t[dh]>", re.IGNORECASE | re.DOTALL)
+_TAG_RE    = re.compile(r"<[^>]+>")
 
 
 # ---------------------------------------------------------------------------
@@ -131,8 +135,40 @@ def _version_tuple(version_str: str) -> Tuple[int, ...]:
         return (0,)
 
 
+def _cell_text(raw: str) -> str:
+    text = html.unescape(_TAG_RE.sub("", raw))
+    return re.sub(r"\s+", " ", text.replace("\xa0", " ")).strip()
+
+
+def _parse_builds(content: str) -> Tuple[Optional[str], Optional[str]]:
+    """Parse (latest_cu, latest_cu_gdr) from a build-versions page.
+
+    Tolerant: table rows are split first, cell attributes/whitespace/nbsp are
+    ignored. CU row = first cell "CUnn [(Latest)]" (no GDR); the second cell is
+    the build number. CU+GDR = highest build number in the second column of
+    any row.
+    """
+    cu: List[str] = []
+    allb: List[str] = []
+    for row in _ROW_RE.findall(content):
+        cells = [_cell_text(c) for c in _CELL_RE.findall(row)]
+        if len(cells) < 2:
+            continue
+        m = _BUILD_RE.fullmatch(cells[1])
+        if not m:
+            continue
+        allb.append(m.group(1))
+        if _CU_NAME_RE.match(cells[0]):
+            cu.append(m.group(1))
+    return (
+        max(cu, key=_version_tuple) if cu else None,
+        max(allb, key=_version_tuple) if allb else None,
+    )
+
+
 def _fetch_latest_builds(year: str) -> Tuple[Optional[str], Optional[str]]:
-    """Returns (latest_cu, latest_cu_gdr) for the given SQL Server year."""
+    """Returns (latest_cu, latest_cu_gdr) for the given SQL Server year.
+    HTTP redirects (Learn -> support.microsoft.com) are followed."""
     url = _MSLEARN_URL.format(year=year)
     try:
         req = urllib.request.Request(
@@ -140,73 +176,144 @@ def _fetch_latest_builds(year: str) -> Tuple[Optional[str], Optional[str]]:
             headers={
                 "User-Agent": "Mozilla/5.0 (compatible; CheckMK/1.0)",
                 "Accept": "text/html,application/xhtml+xml",
+                "Accept-Language": "en-US,en;q=0.9",
             },
         )
         with urllib.request.urlopen(req, timeout=_HTTP_TIMEOUT) as resp:
             content = resp.read().decode("utf-8", errors="replace")
     except Exception:
         return None, None
-
-    cu_builds  = [m.group(1) for m in _CU_BUILD_RE.finditer(content)]
-    all_builds = [m.group(1) for m in _ALL_BUILD_RE.finditer(content)]
-
-    latest_cu     = max(cu_builds,  key=_version_tuple) if cu_builds  else None
-    latest_cu_gdr = max(all_builds, key=_version_tuple) if all_builds else None
-
-    return latest_cu, latest_cu_gdr
+    return _parse_builds(content)
 
 
-def _load_or_refresh_cache() -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
-    path     = _cache_path()
-    do_fetch = False
-
-    if not os.path.exists(path):
-        do_fetch = True
-    else:
-        age = time.time() - os.path.getmtime(path)
-        if age > _CACHE_MAX_AGE_SECONDS:
-            do_fetch = True
-
-    if do_fetch:
-        result: Dict[str, Any] = {}
-        for year in _SQL_VERSIONS:
-            latest_cu, latest_cu_gdr = _fetch_latest_builds(year)
-            if latest_cu or latest_cu_gdr:
-                result[year] = {}
-                if latest_cu:
-                    result[year]["cu"] = latest_cu
-                if latest_cu_gdr:
-                    result[year]["cu_gdr"] = latest_cu_gdr
-
-        if not result:
-            if os.path.exists(path):
-                try:
-                    with open(path, encoding="utf-8") as fh:
-                        data = json.load(fh)
-                    return data, "WARNING: Could not refresh build data (using stale cache)"
-                except (OSError, json.JSONDecodeError):
-                    pass
-            return None, (
-                "Could not fetch build data from Microsoft Learn "
-                "(check internet access from CMK server to learn.microsoft.com)"
-            )
-
-        result["_fetched_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-        try:
-            os.makedirs(os.path.dirname(path), exist_ok=True)
-            with open(path, "w", encoding="utf-8") as fh:
-                json.dump(result, fh, indent=2)
-        except OSError:
-            pass
-
-        return result, None
-
+def _read_cache(path: str) -> Dict[str, Any]:
+    """Read cache; anything unusable (missing, corrupt, old format) -> {}."""
     try:
         with open(path, encoding="utf-8") as fh:
             data = json.load(fh)
-        return data, None
-    except (OSError, json.JSONDecodeError) as exc:
-        return None, "Cache file not readable: {}".format(exc)
+    except (OSError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _write_cache_atomic(path: str, data: Dict[str, Any]) -> None:
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = "{}.{}.tmp".format(path, os.getpid())
+    try:
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(data, fh, indent=2)
+        os.replace(tmp, path)
+    finally:
+        if os.path.exists(tmp):
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+
+
+def _try_lock(lock_path: str) -> bool:
+    try:
+        if os.path.exists(lock_path) and time.time() - os.path.getmtime(lock_path) > _LOCK_STALE_SECONDS:
+            os.unlink(lock_path)
+    except OSError:
+        pass
+    try:
+        os.close(os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY))
+        return True
+    except OSError:
+        return False
+
+
+def _year_entry_ok(entry: Any) -> bool:
+    return isinstance(entry, dict) and bool(entry.get("cu_gdr") or entry.get("cu"))
+
+
+def _year_is_fresh(entry: Any, now: float) -> bool:
+    return (
+        _year_entry_ok(entry)
+        and isinstance(entry.get("_ts"), (int, float))
+        and now - entry["_ts"] <= _CACHE_MAX_AGE_SECONDS
+    )
+
+
+def _load_or_refresh_cache(
+    needed_year: Optional[str] = None,
+) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
+    """Per-year self-healing cache.
+
+    - A year is refreshed when missing, in old format, or older than 24h.
+    - Failed years keep their previous (stale) value; failed years without any
+      value are retried at most every 30 minutes.
+    - Only one process refreshes at a time (lock file); others use the cache.
+    - The file is written atomically and never loses years already known.
+    """
+    path = _cache_path()
+    now = time.time()
+    data = _read_cache(path)
+    failed: Dict[str, Any] = data.get("_failed") if isinstance(data.get("_failed"), dict) else {}
+
+    years = [needed_year] if needed_year else list(_SQL_VERSIONS)
+    todo = [
+        y for y in years
+        if not _year_is_fresh(data.get(y), now)
+        and not (isinstance(failed.get(y), (int, float)) and now - failed[y] < _RETRY_FAILED_SECONDS)
+    ]
+
+    if todo:
+        lock_path = path + ".lock"
+        try:
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+        except OSError:
+            pass
+        if _try_lock(lock_path):
+            try:
+                data = _read_cache(path)  # re-read: another process may have just finished
+                failed = data.get("_failed") if isinstance(data.get("_failed"), dict) else {}
+                start = time.time()
+                changed = False
+                for y in todo:
+                    if _year_is_fresh(data.get(y), time.time()):
+                        continue
+                    if time.time() - start > _FETCH_BUDGET_SECONDS:
+                        break
+                    cu, cu_gdr = _fetch_latest_builds(y)
+                    if cu or cu_gdr:
+                        entry: Dict[str, Any] = {"_ts": time.time()}
+                        if cu:
+                            entry["cu"] = cu
+                        if cu_gdr:
+                            entry["cu_gdr"] = cu_gdr
+                        data[y] = entry
+                        failed.pop(y, None)
+                    else:
+                        failed[y] = time.time()
+                    changed = True
+                if changed:
+                    data["_schema"] = _CACHE_SCHEMA
+                    data["_failed"] = failed
+                    data["_fetched_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+                    try:
+                        _write_cache_atomic(path, data)
+                    except OSError:
+                        pass
+            finally:
+                try:
+                    os.unlink(lock_path)
+                except OSError:
+                    pass
+        else:
+            data = _read_cache(path)
+
+    if needed_year:
+        entry = data.get(needed_year)
+        if not _year_entry_ok(entry):
+            return None, (
+                "No build data for SQL Server {} available (fetch from Microsoft failed or "
+                "is in progress; retry in a few minutes)".format(needed_year)
+            )
+        if not _year_is_fresh(entry, now):
+            return data, "Build data for SQL Server {} is older than 24h (refresh failed, using stale data)".format(needed_year)
+    return data, None
 
 
 # ---------------------------------------------------------------------------
@@ -299,7 +406,7 @@ def check_mssql_version_check(
 
     summary_base = "Version: {}".format(version_display)
 
-    cache, cache_error = _load_or_refresh_cache()
+    cache, cache_error = _load_or_refresh_cache(year)
 
     if cache_error and cache is None:
         yield Result(state=State.UNKNOWN, summary="{} | {}".format(summary_base, cache_error))
